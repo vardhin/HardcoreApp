@@ -13,13 +13,17 @@
  * can use these classes.
  * ----------------------------------------------------------------------- */
 
-/* ---- generic part shell ---- */
+/* ---- generic part shell ----
+ * The chip body itself is now drawn by an SVG "template" graphic
+ * (chip_symbols.js) inside .chip-art. The shell only carries the drop
+ * shadow, the selection outline and the drag affordances — its background
+ * is transparent so the vector symbol shows through cleanly. */
 .part {
 	position: absolute;
-	border: 1px solid #536071;
+	border: none;
 	border-radius: 9px;
-	background: #263140;
-	box-shadow: 0 14px 36px rgb(0 0 0 / 0.3);
+	background: transparent;
+	filter: drop-shadow(0 12px 28px rgb(0 0 0 / 0.4));
 	cursor: grab;
 	user-select: none;
 	touch-action: none;
@@ -58,166 +62,9 @@
 	color: #9aa6b5;
 }
 
-/* ---- blue-pill (STM32 dev board) ---- */
-.blue-pill {
-	background: #1e4f98;
-	border-color: #6697d6;
-}
-
-.usb {
-	position: absolute;
-	left: 68px;
-	top: -14px;
-	width: 56px;
-	height: 30px;
-	display: grid;
-	place-items: center;
-	border-radius: 4px;
-	background: #c5ced8;
-	color: #17202b;
-	font-size: 0.66rem;
-	font-weight: 800;
-}
-
-.chip,
-.driver-chip {
-	position: absolute;
-	left: 58px;
-	top: 86px;
-	width: 74px;
-	height: 74px;
-	display: grid;
-	place-items: center;
-	border-radius: 7px;
-	background: #11151b;
-	border: 1px solid #384252;
-	font-size: 0.68rem;
-}
-
-.crystal {
-	position: absolute;
-	left: 74px;
-	top: 174px;
-	width: 42px;
-	height: 16px;
-	border-radius: 20px;
-	background: #d7dde5;
-}
-
-.reset,
-.direction {
-	position: absolute;
-	right: 16px;
-	bottom: 22px;
-	font-size: 0.62rem;
-	color: #dbeafe;
-}
-
-.direction {
-	left: 16px;
-	right: auto;
-}
-
-/* ---- motor ---- */
-.motor {
-	background: #303844;
-}
-
-.motor-body {
-	position: absolute;
-	left: 42px;
-	top: 18px;
-	width: 78px;
-	height: 78px;
-	display: grid;
-	place-items: center;
-	border-radius: 50%;
-	background: radial-gradient(circle, #dce3ea 0 38%, #8792a0 39% 60%, #313a45 61%);
-	color: #202630;
-	font-weight: 900;
-}
-
-.shaft {
-	position: absolute;
-	right: -26px;
-	top: 51px;
-	width: 36px;
-	height: 8px;
-	border-radius: 8px;
-	background: #aeb8c6;
-}
-
-/* ---- driver (L298N) ---- */
-.driver {
-	background: #27313d;
-}
-
-.driver-chip {
-	left: 58px;
-	top: 44px;
-	width: 74px;
-	height: 44px;
-}
-
-.sink {
-	position: absolute;
-	left: 136px;
-	top: 24px;
-	width: 32px;
-	height: 88px;
-	background: repeating-linear-gradient(90deg, #9aa6b5 0 4px, #566273 4px 8px);
-}
-
-/* ---- led ---- */
-.led-glow {
-	position: absolute;
-	left: 34px;
-	top: 26px;
-	width: 38px;
-	height: 38px;
-	border-radius: 50%;
-	background: #ff5a71;
-	box-shadow: 0 0 18px #ff5a71;
-}
-
-/* ---- resistor ---- */
-.resistor-body {
-	position: absolute;
-	left: 30px;
-	top: 25px;
-	width: 70px;
-	height: 20px;
-	border-radius: 20px;
-	background: linear-gradient(
-		90deg,
-		#d7b46a 0 24%,
-		#70372b 24% 34%,
-		#d7b46a 34% 56%,
-		#c83f3f 56% 66%,
-		#d7b46a 66%
-	);
-}
-
-/* ---- battery ---- */
-.battery-cap {
-	position: absolute;
-	top: -10px;
-	left: 38px;
-	width: 34px;
-	height: 12px;
-	background: #9aa6b5;
-	border-radius: 4px 4px 0 0;
-}
-
-.battery-label {
-	position: absolute;
-	inset: 38px 18px;
-	display: grid;
-	place-items: center;
-	border-radius: 6px;
-	background: #242b35;
-	font-weight: 900;
-}
+/* Per-type chip bodies (blue-pill / motor / driver / led / resistor /
+ * battery) are now vector graphics authored in $lib/chip_symbols.js and
+ * rendered into .chip-art. Add a new visual_type there, not here. */
 
 /* ---- pins ---- */
 .pin {

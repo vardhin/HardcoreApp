@@ -527,9 +527,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="HardcoreAI API", version="0.3.0", lifespan=lifespan)
 
+# Accept any localhost/127.0.0.1 port: Vite picks 5173 but falls back to
+# 5174+ when that's taken, and `vite preview` uses 4173 — pinning a narrow
+# port range caused the dev frontend to be blocked by CORS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):51[0-9][0-9]",
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -732,6 +735,151 @@ def upsert_file(project_id: str, file_path: str, payload: CodeFileUpsert) -> Cod
             path=code_file.path, language=code_file.language,
             content=code_file.content, updated_at=code_file.updated_at,
         )
+
+
+# ---------------------------------------------------------------------------
+# AI agent — two-phase (wire the workbench, then write the firmware).
+#
+# The agent uses a C-style THINK/CALL tool-calling loop (see agent.py). Phase 1
+# and phase 2 each run in an isolated context window. Tools mutate the database
+# through the same helpers the REST routes use, so the frontend just re-fetches
+# the workbench/files when the run finishes.
+# ---------------------------------------------------------------------------
+
+import llm  # noqa: E402
+from solver import run_coding_phase, run_wiring_phase  # noqa: E402
+
+
+class AgentRequest(BaseModel):
+    """A request to run the agent on a project."""
+
+    provider: str = "llamacpp"
+    problem: str = ""
+
+
+class PhaseTrace(BaseModel):
+    phase: str
+    steps: list[dict[str, Any]]
+    final: str
+
+
+class AgentRunResult(BaseModel):
+    provider: str
+    wiring: PhaseTrace
+    coding: PhaseTrace
+    workbench: WorkbenchState
+    files: list[CodeFileRead]
+
+
+@app.get("/api/agent/providers")
+def list_agent_providers() -> dict[str, Any]:
+    """Which LLM providers the backend can reach (key present / local)."""
+    return {"providers": llm.available_providers()}
+
+
+def _files_as_dict(session: Session, project: ProjectRow) -> dict[str, dict[str, str]]:
+    rows = session.exec(
+        select(CodeFileRow).where(CodeFileRow.project_id == project.id)
+    ).all()
+    return {r.path: {"language": r.language, "content": r.content} for r in rows}
+
+
+@app.post("/api/projects/{project_id}/agent/solve", response_model=AgentRunResult)
+async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
+    """Run the two-phase agent: configure + wire the workbench, then write code.
+
+    Phase 1 reasons over the problem and the catalogue and writes the netlist.
+    Phase 2 starts fresh, sees only the finished netlist, and writes src/main.c.
+    Both phases' THINK/CALL traces come back for display.
+    """
+    if payload.provider not in llm.PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Unknown provider '{payload.provider}'.")
+
+    with Session(engine) as session:
+        project = get_project_or_404(session, project_id)
+        catalogue = catalogue_index(session)
+        state = read_workbench(session, project)
+        workbench_dict = state.model_dump()
+
+    # --- Phase 1: wiring (isolated context) --------------------------------
+    try:
+        wiring_trace, wired = await run_wiring_phase(
+            provider=payload.provider,
+            project_name=project.name,
+            problem=payload.problem,
+            catalogue=catalogue,
+            workbench=workbench_dict,
+        )
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM error (wiring): {exc}")
+
+    # Persist the netlist the wiring phase produced.
+    with Session(engine) as session:
+        project = get_project_or_404(session, project_id)
+        write_workbench(session, project, WorkbenchState(**wired))
+        session.commit()
+        # Re-read so phase 2 (and the response) see canonical db ids.
+        project = get_project_or_404(session, project_id)
+        saved_state = read_workbench(session, project)
+        files_dict = _files_as_dict(session, project)
+        catalogue = catalogue_index(session)
+
+    # --- Phase 2: coding (brand-new context) -------------------------------
+    try:
+        coding_trace, new_files = await run_coding_phase(
+            provider=payload.provider,
+            project_name=project.name,
+            problem=payload.problem,
+            catalogue=catalogue,
+            workbench=saved_state.model_dump(),
+            files=files_dict,
+        )
+    except llm.LLMError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM error (coding): {exc}")
+
+    # Persist any files the coding phase wrote.
+    with Session(engine) as session:
+        project = get_project_or_404(session, project_id)
+        for path, meta in new_files.items():
+            if files_dict.get(path) == meta:
+                continue  # unchanged — skip the write
+            code_file = session.exec(
+                select(CodeFileRow).where(
+                    CodeFileRow.project_id == project.id, CodeFileRow.path == path
+                )
+            ).first()
+            if not code_file:
+                code_file = CodeFileRow(project_id=project.id, path=path)
+            code_file.language = meta.get("language", "c")
+            code_file.content = meta.get("content", "")
+            code_file.updated_at = now_utc()
+            session.add(code_file)
+        project.updated_at = now_utc()
+        session.add(project)
+        session.commit()
+
+        project = get_project_or_404(session, project_id)
+        final_state = read_workbench(session, project)
+        final_files = session.exec(
+            select(CodeFileRow)
+            .where(CodeFileRow.project_id == project.id)
+            .order_by(CodeFileRow.path)
+        ).all()
+
+    return AgentRunResult(
+        provider=payload.provider,
+        wiring=PhaseTrace(
+            phase=wiring_trace.phase, steps=wiring_trace.steps, final=wiring_trace.final
+        ),
+        coding=PhaseTrace(
+            phase=coding_trace.phase, steps=coding_trace.steps, final=coding_trace.final
+        ),
+        workbench=final_state,
+        files=[
+            CodeFileRead(path=f.path, language=f.language, content=f.content, updated_at=f.updated_at)
+            for f in final_files
+        ],
+    )
 
 
 @app.post("/api/projects/{project_id}/generate", response_model=FirmwareResult)

@@ -3,6 +3,9 @@
 	import { fade, fly } from 'svelte/transition';
 	import CodeEditor from '$lib/CodeEditor.svelte';
 	import ContextMenu from '$lib/ContextMenu.svelte';
+	import AssistantPanel from '$lib/AssistantPanel.svelte';
+	import { background } from '$lib/chip_symbols.js';
+	import { compatibility, connectionWarning, canConnect, ROLE_LABEL } from '$lib/wiring.js';
 
 	const API_BASE = 'http://127.0.0.1:8000';
 	const wireColors = ['#52d1a4', '#f59e0b', '#60a5fa', '#f472b6', '#f87171', '#a78bfa'];
@@ -16,6 +19,7 @@
 	let workbench = $state({ placed_components: [], wires: [], viewport: { x: 0, y: 0, zoom: 1 } });
 	let selectedProject = $state(null);
 	let selectedComponentId = $state(null);
+	let selectedIds = $state([]); // multi-select: every picked component instance
 	let selectedWireId = $state(null);
 	let activeFilePath = $state('');
 	let activeView = $state('dashboard');
@@ -37,6 +41,11 @@
 	let clipboard = $state(null); // a copied placed-component instance
 	let lastCanvasPoint = $state({ x: 480, y: 280 });
 
+	// Drag-to-wire: an in-progress wire being dragged from a pin. `cursor` is the
+	// live pointer position in canvas space; `hover` is the pin under it (if any).
+	let wiring = $state(null); // { from:{componentId,pinName,role}, cursor:{x,y}, hover }
+	let schematicCollapsed = $state({}); // instanceId -> bool, schematic panel folds
+
 	let saveTimer;
 	let toastSeq = 0;
 
@@ -55,6 +64,14 @@
 	);
 	let activeFile = $derived(files.find((file) => file.path === activeFilePath));
 	let selectedWire = $derived(workbench.wires.find((wire) => wire.id === selectedWireId));
+
+	// The components shown in the Schematic pin panel: whatever is multi-selected,
+	// or — when nothing is selected — every placed component.
+	let schematicComponents = $derived(
+		selectedIds.length
+			? workbench.placed_components.filter((c) => selectedIds.includes(c.id))
+			: workbench.placed_components
+	);
 
 	onMount(async () => {
 		await Promise.all([loadComponents(), loadProjects()]);
@@ -78,15 +95,19 @@
 		const inField = ['INPUT', 'TEXTAREA'].includes(event.target?.tagName);
 		const mod = event.ctrlKey || event.metaKey;
 		if (activeView === 'workbench' && !inField) {
-			if ((event.key === 'Delete' || event.key === 'Backspace') && (selectedComponentId || selectedWireId)) {
+			if ((event.key === 'Delete' || event.key === 'Backspace') && (selectedIds.length || selectedWireId)) {
 				event.preventDefault();
 				deleteSelected();
 			}
 			if (event.key === 'Escape') {
-				selectedComponentId = null;
-				selectedWireId = null;
+				clearSelection();
 				pendingPin = null;
+				wiring = null;
 				contextMenu?.close();
+			}
+			if (mod && event.key === 'a') {
+				event.preventDefault();
+				selectAllComponents();
 			}
 			if (event.key === 'r' && !mod && selectedComponentId) {
 				event.preventDefault();
@@ -332,6 +353,29 @@
 		}
 	}
 
+	/** Called by the AI panel once the two-phase agent finishes. The agent has
+	 *  already written the netlist and code files to the database, so we just
+	 *  re-pull both into the editor and surface its summary as a toast. */
+	async function onAgentDone(runResult) {
+		if (!selectedProject) return;
+		try {
+			await Promise.all([
+				loadWorkbench(selectedProject.id),
+				loadFiles(selectedProject.id)
+			]);
+			workbenchDirty = false;
+			fileDirty = false;
+			// Show generated main.c if the coding phase produced one.
+			if (files.some((f) => f.path === 'src/main.c')) activeFilePath = 'src/main.c';
+			touchProjectTimestamp();
+			const wired = runResult?.wiring?.steps?.length ?? 0;
+			const coded = runResult?.coding?.steps?.length ?? 0;
+			toast(`AI agent done — ${wired} wiring step(s), ${coded} coding step(s).`, 'success');
+		} catch (error) {
+			toast(`Could not reload after the agent ran: ${error.message}`, 'error');
+		}
+	}
+
 	function touchProjectTimestamp() {
 		if (!selectedProject) return;
 		const stamp = new Date().toISOString();
@@ -377,10 +421,44 @@
 			config: {}
 		};
 		workbench.placed_components = [...workbench.placed_components, instance];
-		selectedComponentId = instance.id;
-		selectedWireId = null;
+		selectComponent(instance.id);
 		workbenchDirty = true;
 		setStatus('Unsaved changes', true);
+	}
+
+	// --- selection ---------------------------------------------------------
+	// `selectedComponentId` is kept as the "primary" of the selection so the
+	// existing single-target actions (rotate, inspector) keep working.
+
+	/** Select a component. `additive` (Shift/Ctrl-click) toggles it in/out of
+	 *  the multi-selection instead of replacing it. */
+	function selectComponent(id, additive = false) {
+		selectedWireId = null;
+		if (additive) {
+			selectedIds = selectedIds.includes(id)
+				? selectedIds.filter((x) => x !== id)
+				: [...selectedIds, id];
+		} else {
+			selectedIds = [id];
+		}
+		selectedComponentId = selectedIds[selectedIds.length - 1] ?? null;
+	}
+
+	function clearSelection() {
+		selectedIds = [];
+		selectedComponentId = null;
+		selectedWireId = null;
+	}
+
+	function isSelected(id) {
+		return selectedIds.includes(id);
+	}
+
+	/** Select every placed component (Ctrl+A on the workbench). */
+	function selectAllComponents() {
+		selectedIds = workbench.placed_components.map((c) => c.id);
+		selectedComponentId = selectedIds[selectedIds.length - 1] ?? null;
+		selectedWireId = null;
 	}
 
 	function dragComponent(event, component) {
@@ -402,16 +480,28 @@
 
 	function startMove(event, instance) {
 		if (event.target.closest('.pin')) return;
+		if (event.button !== 0) return;
 		event.preventDefault();
-		selectedComponentId = instance.id;
-		selectedWireId = null;
+		const additive = event.shiftKey || event.ctrlKey || event.metaKey;
+		// Click on an already-selected member keeps the whole group; otherwise
+		// (re)set the selection to this instance.
+		if (!isSelected(instance.id) || additive) {
+			selectComponent(instance.id, additive);
+		} else {
+			selectedComponentId = instance.id;
+			selectedWireId = null;
+		}
 		const canvas = event.currentTarget.closest('.workbench');
 		const rect = canvas.getBoundingClientRect();
+		// Move every selected component together; remember each one's grab offset.
+		const group = workbench.placed_components.filter((c) => selectedIds.includes(c.id));
 		moving = {
-			id: instance.id,
 			rect,
-			offsetX: event.clientX - rect.left - instance.x,
-			offsetY: event.clientY - rect.top - instance.y
+			members: group.map((c) => ({
+				id: c.id,
+				offsetX: event.clientX - rect.left - c.x,
+				offsetY: event.clientY - rect.top - c.y
+			}))
 		};
 		window.addEventListener('pointermove', moveComponent);
 		window.addEventListener('pointerup', stopMove, { once: true });
@@ -419,16 +509,22 @@
 
 	function moveComponent(event) {
 		if (!moving) return;
-		const def = definition(
-			workbench.placed_components.find((p) => p.id === moving.id)?.definition_id
-		);
-		const { x, y } = clampPosition(
-			event.clientX - moving.rect.left - moving.offsetX,
-			event.clientY - moving.rect.top - moving.offsetY,
-			def
-		);
+		const next = new Map();
+		for (const member of moving.members) {
+			const def = definition(
+				workbench.placed_components.find((p) => p.id === member.id)?.definition_id
+			);
+			next.set(
+				member.id,
+				clampPosition(
+					event.clientX - moving.rect.left - member.offsetX,
+					event.clientY - moving.rect.top - member.offsetY,
+					def
+				)
+			);
+		}
 		workbench.placed_components = workbench.placed_components.map((instance) =>
-			instance.id === moving.id ? { ...instance, x, y } : instance
+			next.has(instance.id) ? { ...instance, ...next.get(instance.id) } : instance
 		);
 	}
 
@@ -452,53 +548,169 @@
 		return `${instance?.display_name ?? 'Component'} ${pin?.label ?? pinName}`;
 	}
 
+	/** The pin's signal role ('gpio', 'power', ...) for compatibility checks. */
+	function pinRole(instanceId, pinName) {
+		const instance = workbench.placed_components.find((item) => item.id === instanceId);
+		const def = instance ? definition(instance.definition_id) : null;
+		return def?.pins.find((item) => item.name === pinName)?.role ?? 'gpio';
+	}
+
+	/** True if this exact pin already has at least one wire on it. */
+	function pinIsWired(instanceId, pinName) {
+		return workbench.wires.some(
+			(w) =>
+				(w.from.componentId === instanceId && w.from.pinName === pinName) ||
+				(w.to.componentId === instanceId && w.to.pinName === pinName)
+		);
+	}
+
+	/** Does a wire already join these two specific pins (either direction)? */
+	function wireExists(a, b) {
+		return workbench.wires.some((wire) => {
+			const w1 = `${wire.from.componentId}:${wire.from.pinName}`;
+			const w2 = `${wire.to.componentId}:${wire.to.pinName}`;
+			const p = `${a.componentId}:${a.pinName}`;
+			const q = `${b.componentId}:${b.pinName}`;
+			return (w1 === p && w2 === q) || (w1 === q && w2 === p);
+		});
+	}
+
+	/** Create a wire between two endpoints. Returns true if one was added.
+	 *  Honours the warn-but-allow policy: any pair connects, dubious ones toast. */
+	function createWire(a, b) {
+		if (!canConnect(a, b)) return false;
+		if (wireExists(a, b)) {
+			toast('Those pins are already connected.', 'warn');
+			return false;
+		}
+		const roleA = pinRole(a.componentId, a.pinName);
+		const roleB = pinRole(b.componentId, b.pinName);
+		const wire = {
+			id: uid('wire'),
+			from: { componentId: a.componentId, pinName: a.pinName },
+			to: { componentId: b.componentId, pinName: b.pinName },
+			color: wireColors[workbench.wires.length % wireColors.length],
+			label: `${pinLabel(a.componentId, a.pinName)} → ${pinLabel(b.componentId, b.pinName)}`
+		};
+		workbench.wires = [...workbench.wires, wire];
+		selectedWireId = wire.id;
+		workbenchDirty = true;
+		setStatus('Unsaved changes', true);
+		const warning = connectionWarning(roleA, roleB);
+		if (warning) toast(warning, 'warn');
+		return true;
+	}
+
 	function pinExists(endpoint) {
 		const instance = workbench.placed_components.find((i) => i.id === endpoint.componentId);
 		const def = instance ? definition(instance.definition_id) : null;
 		return Boolean(def?.pins.some((p) => p.name === endpoint.pinName));
 	}
 
-	function clickPin(event, instance, pin) {
+	// --- wiring: drag a pin onto another, or click two pins in turn ---------
+
+	/** Pointer pressed on a pin. Starts a drag-wire; if a `pendingPin` is armed
+	 *  (click-to-wire mode) we leave it — `clickPin` on pointerup completes it. */
+	function startWire(event, instance, pin) {
+		if (event.button !== 0) return;
 		event.stopPropagation();
-		selectedComponentId = instance.id;
-		selectedWireId = null;
-
-		if (!pendingPin) {
-			pendingPin = { componentId: instance.id, pinName: pin.name };
-			return;
-		}
-
-		if (pendingPin.componentId === instance.id && pendingPin.pinName === pin.name) {
-			pendingPin = null;
-			return;
-		}
-
-		// Prevent duplicate wires between the same two pins.
-		const exists = workbench.wires.some((wire) => {
-			const a = `${wire.from.componentId}:${wire.from.pinName}`;
-			const b = `${wire.to.componentId}:${wire.to.pinName}`;
-			const p = `${pendingPin.componentId}:${pendingPin.pinName}`;
-			const q = `${instance.id}:${pin.name}`;
-			return (a === p && b === q) || (a === q && b === p);
-		});
-		if (exists) {
-			toast('Those pins are already connected.', 'warn');
-			pendingPin = null;
-			return;
-		}
-
-		const wire = {
-			id: uid('wire'),
-			from: pendingPin,
-			to: { componentId: instance.id, pinName: pin.name },
-			color: wireColors[workbench.wires.length % wireColors.length],
-			label: `${pinLabel(pendingPin.componentId, pendingPin.pinName)} → ${pinLabel(instance.id, pin.name)}`
+		event.preventDefault();
+		selectComponent(instance.id, event.shiftKey || event.ctrlKey || event.metaKey);
+		const canvas = event.currentTarget.closest('.workbench');
+		const rect = canvas?.getBoundingClientRect();
+		wiring = {
+			from: { componentId: instance.id, pinName: pin.name, role: pin.role },
+			rect,
+			scroll: { x: canvas?.scrollLeft ?? 0, y: canvas?.scrollTop ?? 0 },
+			cursor: pinPosition(instance, pin),
+			hover: null,
+			moved: false
 		};
-		workbench.wires = [...workbench.wires, wire];
+		window.addEventListener('pointermove', dragWire);
+		window.addEventListener('pointerup', endWire, { once: true });
+	}
+
+	function dragWire(event) {
+		if (!wiring || !wiring.rect) return;
+		wiring.moved = true;
+		wiring.cursor = {
+			x: event.clientX - wiring.rect.left + wiring.scroll.x,
+			y: event.clientY - wiring.rect.top + wiring.scroll.y
+		};
+		// Find a pin button under the pointer to snap/highlight.
+		const el = document.elementFromPoint(event.clientX, event.clientY)?.closest('.pin');
+		if (el && el.dataset.componentId && el.dataset.pinName) {
+			wiring.hover = { componentId: el.dataset.componentId, pinName: el.dataset.pinName };
+		} else {
+			wiring.hover = null;
+		}
+	}
+
+	function endWire(event) {
+		window.removeEventListener('pointermove', dragWire);
+		if (!wiring) return;
+		const drag = wiring;
+		wiring = null;
+
+		// A press without movement = click-to-wire: fall through to clickPin.
+		if (!drag.moved) {
+			const inst = workbench.placed_components.find((c) => c.id === drag.from.componentId);
+			const def = inst ? definition(inst.definition_id) : null;
+			const pin = def?.pins.find((p) => p.name === drag.from.pinName);
+			if (inst && pin) clickPin(inst, pin);
+			return;
+		}
+
+		// A real drag: connect to whatever pin we were released over.
+		const target =
+			drag.hover ??
+			(() => {
+				const el = document
+					.elementFromPoint(event.clientX, event.clientY)
+					?.closest('.pin');
+				return el?.dataset.componentId
+					? { componentId: el.dataset.componentId, pinName: el.dataset.pinName }
+					: null;
+			})();
+		if (target) {
+			createWire(
+				{ componentId: drag.from.componentId, pinName: drag.from.pinName },
+				target
+			);
+		}
 		pendingPin = null;
-		selectedWireId = wire.id;
-		workbenchDirty = true;
-		setStatus('Unsaved changes', true);
+	}
+
+	/** Click-to-wire fallback: first click arms a pin, second click connects. */
+	function clickPin(instance, pin) {
+		selectComponent(instance.id);
+		const here = { componentId: instance.id, pinName: pin.name };
+		if (!pendingPin) {
+			pendingPin = here;
+			return;
+		}
+		if (pendingPin.componentId === here.componentId && pendingPin.pinName === here.pinName) {
+			pendingPin = null;
+			return;
+		}
+		createWire(pendingPin, here);
+		pendingPin = null;
+	}
+
+	/** Live highlight state for a pin while a drag-wire is in progress.
+	 *  Returns '' | 'compat-ideal' | 'compat-ok' | 'compat-warn' | 'compat-self'. */
+	function pinDragState(instanceId, pinName, pinRoleValue) {
+		if (!wiring) return '';
+		const from = wiring.from;
+		if (from.componentId === instanceId && from.pinName === pinName) return 'compat-self';
+		if (
+			wireExists(
+				{ componentId: from.componentId, pinName: from.pinName },
+				{ componentId: instanceId, pinName: pinName }
+			)
+		)
+			return 'compat-warn';
+		return `compat-${compatibility(from.role, pinRoleValue)}`;
 	}
 
 	function wireEndpoint(endpoint) {
@@ -524,27 +736,28 @@
 			setStatus('Unsaved changes', true);
 			return;
 		}
-		if (selectedComponentId) {
-			const removed = workbench.placed_components.find((i) => i.id === selectedComponentId);
+		if (selectedIds.length) {
+			const removed = workbench.placed_components.filter((i) => selectedIds.includes(i.id));
+			const gone = new Set(selectedIds);
 			workbench.placed_components = workbench.placed_components.filter(
-				(item) => item.id !== selectedComponentId
+				(item) => !gone.has(item.id)
 			);
 			workbench.wires = workbench.wires.filter(
-				(wire) =>
-					wire.from.componentId !== selectedComponentId &&
-					wire.to.componentId !== selectedComponentId
+				(wire) => !gone.has(wire.from.componentId) && !gone.has(wire.to.componentId)
 			);
-			selectedComponentId = null;
+			clearSelection();
 			workbenchDirty = true;
 			setStatus('Unsaved changes', true);
-			if (removed) toast(`Removed ${removed.display_name}.`, 'info');
+			if (removed.length === 1) toast(`Removed ${removed[0].display_name}.`, 'info');
+			else if (removed.length > 1) toast(`Removed ${removed.length} components.`, 'info');
 		}
 	}
 
 	function rotateSelected() {
-		if (!selectedComponentId) return;
+		if (!selectedIds.length) return;
+		const ids = new Set(selectedIds);
 		workbench.placed_components = workbench.placed_components.map((item) =>
-			item.id === selectedComponentId
+			ids.has(item.id)
 				? { ...item, rotation: ((item.rotation ?? 0) + 90) % 360 }
 				: item
 		);
@@ -557,8 +770,7 @@
 		if (!confirm('Remove every component and wire from the workbench?')) return;
 		workbench.placed_components = [];
 		workbench.wires = [];
-		selectedComponentId = null;
-		selectedWireId = null;
+		clearSelection();
 		pendingPin = null;
 		workbenchDirty = true;
 		setStatus('Unsaved changes', true);
@@ -580,8 +792,7 @@
 			y
 		};
 		workbench.placed_components = [...workbench.placed_components, copy];
-		selectedComponentId = copy.id;
-		selectedWireId = null;
+		selectComponent(copy.id);
 		workbenchDirty = true;
 		setStatus('Unsaved changes', true);
 		toast(`Duplicated ${instance.display_name}.`, 'info');
@@ -598,8 +809,7 @@
 		const pos = clampPosition(x, y, def);
 		const copy = { ...structuredClone(clipboard), id: uid('part'), x: pos.x, y: pos.y };
 		workbench.placed_components = [...workbench.placed_components, copy];
-		selectedComponentId = copy.id;
-		selectedWireId = null;
+		selectComponent(copy.id);
 		workbenchDirty = true;
 		setStatus('Unsaved changes', true);
 		toast(`Pasted ${copy.display_name}.`, 'info');
@@ -620,7 +830,8 @@
 		workbench.wires = workbench.wires.filter(
 			(w) => w.from.componentId !== id && w.to.componentId !== id
 		);
-		if (selectedComponentId === id) selectedComponentId = null;
+		selectedIds = selectedIds.filter((x) => x !== id);
+		if (selectedComponentId === id) selectedComponentId = selectedIds.at(-1) ?? null;
 		workbenchDirty = true;
 		setStatus('Unsaved changes', true);
 		if (removed) toast(`Removed ${removed.display_name}.`, 'info');
@@ -671,17 +882,29 @@
 
 	function openComponentMenu(event, instance) {
 		event.stopPropagation();
-		selectedComponentId = instance.id;
-		selectedWireId = null;
+		// Right-clicking outside the current group selects just this one.
+		if (!isSelected(instance.id)) selectComponent(instance.id);
+		else selectedWireId = null;
+		const multi = selectedIds.length > 1 && isSelected(instance.id);
 		contextMenu?.open(event, [
-			{ label: instance.display_name, disabled: true, icon: '▣' },
+			{
+				label: multi ? `${selectedIds.length} components` : instance.display_name,
+				disabled: true,
+				icon: '▣'
+			},
 			{ separator: true },
-			{ label: 'Rotate 90°', icon: '⟳', shortcut: 'R', onSelect: () => rotateComponentById(instance.id) },
+			{ label: multi ? 'Rotate selection' : 'Rotate 90°', icon: '⟳', shortcut: 'R', onSelect: rotateSelected },
 			{ label: 'Duplicate', icon: '⧉', shortcut: 'Ctrl+D', onSelect: () => duplicateComponent(instance) },
 			{ label: 'Copy', icon: '⧉', shortcut: 'Ctrl+C', onSelect: () => copyComponent(instance) },
 			{ label: 'Bring to front', icon: '⬆', onSelect: () => bringToFront(instance) },
 			{ separator: true },
-			{ label: 'Delete', icon: '🗑', danger: true, shortcut: 'Del', onSelect: () => deleteComponentById(instance.id) }
+			{
+				label: multi ? `Delete ${selectedIds.length} components` : 'Delete',
+				icon: '🗑',
+				danger: true,
+				shortcut: 'Del',
+				onSelect: multi ? deleteSelected : () => deleteComponentById(instance.id)
+			}
 		]);
 	}
 
@@ -786,33 +1009,84 @@
 		});
 	}
 
-	// --- schematic mini-map: lay components on a grid, route real wires ----
-	let schematicNodes = $derived(
-		workbench.placed_components.map((instance, index) => ({
-			id: instance.id,
-			name: instance.display_name,
-			x: 20 + (index % 2) * 150,
-			y: 22 + Math.floor(index / 2) * 60,
-			w: 120,
-			h: 38
-		}))
-	);
+	// --- schematic pin panel ----------------------------------------------
+	// The schematic is an interactive pin list. Each placed (or selected)
+	// component is a foldable row; every pin is draggable to wire it up.
 
-	function schematicPath(wire) {
-		const from = schematicNodes.find((n) => n.id === wire.from.componentId);
-		const to = schematicNodes.find((n) => n.id === wire.to.componentId);
-		if (!from || !to) return '';
-		const fx = from.x + from.w / 2;
-		const fy = from.y + from.h / 2;
-		const tx = to.x + to.w / 2;
-		const ty = to.y + to.h / 2;
-		const mid = (fy + ty) / 2;
-		return `M ${fx} ${fy} C ${fx} ${mid}, ${tx} ${mid}, ${tx} ${ty}`;
+	function toggleSchematicFold(id) {
+		schematicCollapsed = { ...schematicCollapsed, [id]: !schematicCollapsed[id] };
 	}
 
-	let schematicHeight = $derived(
-		Math.max(180, 22 + Math.ceil(schematicNodes.length / 2) * 60)
-	);
+	/** All wires touching a given pin, with the far endpoint resolved to text. */
+	function pinConnections(instanceId, pinName) {
+		return workbench.wires
+			.filter(
+				(w) =>
+					(w.from.componentId === instanceId && w.from.pinName === pinName) ||
+					(w.to.componentId === instanceId && w.to.pinName === pinName)
+			)
+			.map((w) => {
+				const near = w.from.componentId === instanceId && w.from.pinName === pinName;
+				const far = near ? w.to : w.from;
+				return { wireId: w.id, color: w.color, label: pinLabel(far.componentId, far.pinName) };
+			});
+	}
+
+	// --- schematic-panel drag-to-wire -------------------------------------
+	// Mirrors the workbench wiring, but anchored to the pin rows in the panel.
+
+	function startSchematicWire(event, instance, pin) {
+		if (event.button !== 0) return;
+		event.stopPropagation();
+		event.preventDefault();
+		wiring = {
+			from: { componentId: instance.id, pinName: pin.name, role: pin.role },
+			rect: null,
+			scroll: { x: 0, y: 0 },
+			cursor: { x: 0, y: 0 },
+			hover: null,
+			moved: false,
+			source: 'schematic'
+		};
+		window.addEventListener('pointermove', dragSchematicWire);
+		window.addEventListener('pointerup', endSchematicWire, { once: true });
+	}
+
+	function dragSchematicWire(event) {
+		if (!wiring) return;
+		wiring.moved = true;
+		const row = document
+			.elementFromPoint(event.clientX, event.clientY)
+			?.closest('.schem-pin');
+		if (row && row.dataset.componentId && row.dataset.pinName) {
+			wiring.hover = { componentId: row.dataset.componentId, pinName: row.dataset.pinName };
+		} else {
+			wiring.hover = null;
+		}
+	}
+
+	function endSchematicWire(event) {
+		window.removeEventListener('pointermove', dragSchematicWire);
+		if (!wiring) return;
+		const drag = wiring;
+		wiring = null;
+		const target =
+			drag.hover ??
+			(() => {
+				const row = document
+					.elementFromPoint(event.clientX, event.clientY)
+					?.closest('.schem-pin');
+				return row?.dataset.componentId
+					? { componentId: row.dataset.componentId, pinName: row.dataset.pinName }
+					: null;
+			})();
+		if (drag.moved && target) {
+			createWire(
+				{ componentId: drag.from.componentId, pinName: drag.from.pinName },
+				target
+			);
+		}
+	}
 </script>
 
 <svelte:head>
@@ -847,6 +1121,38 @@
 				Code
 			</button>
 		</nav>
+
+		<!-- Workbench actions live in the navbar so the canvas gets the full
+		     panel height; they appear only while the Workbench view is open. -->
+		{#if activeView === 'workbench' && selectedProject}
+			<div class="nav-actions">
+				<button class="nav-act" onclick={rotateSelected} disabled={!selectedIds.length}>
+					{selectedIds.length > 1 ? `Rotate ${selectedIds.length}` : 'Rotate'}
+				</button>
+				<button
+					class="nav-act"
+					onclick={deleteSelected}
+					disabled={!selectedIds.length && !selectedWireId}
+				>
+					Delete
+				</button>
+				<button
+					class="nav-act"
+					onclick={clearWorkbench}
+					disabled={!workbench.placed_components.length}
+				>
+					Clear
+				</button>
+				<span class="nav-sep" aria-hidden="true"></span>
+				<button class="nav-act" onclick={generateFirmware} disabled={busy}>
+					{busy ? 'Working…' : 'Generate'}
+				</button>
+				<button class="nav-act primary" onclick={saveWorkbench} disabled={!workbenchDirty}>
+					{workbenchDirty ? 'Save' : 'Saved'}
+				</button>
+			</div>
+		{/if}
+
 		<div class="project-chip">
 			<span class="chip-name">{selectedProject?.name ?? 'No project open'}</span>
 			<strong class:dirty={workbenchDirty || fileDirty}>
@@ -982,36 +1288,17 @@
 			</aside>
 
 			<section class="workbench-panel">
-				<div class="toolbar">
-					<div class="toolbar-info">
-						<strong>{selectedProject.name}</strong>
-						<span class:wiring={pendingPin}>
-							{#if pendingPin}
-								Wiring from {pinLabel(pendingPin.componentId, pendingPin.pinName)} — click a
-								second pin
-							{:else}
-								Click two pins to create a wire · Del removes selection
-							{/if}
-						</span>
-					</div>
-					<div class="row-actions">
-						<button onclick={rotateSelected} disabled={!selectedComponentId}>Rotate</button>
-						<button
-							onclick={deleteSelected}
-							disabled={!selectedComponentId && !selectedWireId}
-						>
-							Delete
-						</button>
-						<button onclick={clearWorkbench} disabled={!workbench.placed_components.length}>
-							Clear
-						</button>
-						<button onclick={generateFirmware} disabled={busy}>
-							{busy ? 'Working…' : 'Generate firmware'}
-						</button>
-						<button class="primary" onclick={saveWorkbench} disabled={!workbenchDirty}>
-							{workbenchDirty ? 'Save workbench' : 'Saved'}
-						</button>
-					</div>
+				<!-- Slim contextual hint strip; the action buttons now live in
+				     the navbar. -->
+				<div class="workbench-hint" class:wiring={pendingPin}>
+					{#if pendingPin}
+						Wiring from {pinLabel(pendingPin.componentId, pendingPin.pinName)} — click a
+						second pin
+					{:else if selectedIds.length > 1}
+						{selectedIds.length} components selected · drag a pin to wire · Del removes
+					{:else}
+						Drag pin to pin to wire · Shift-click to multi-select · Del removes
+					{/if}
 				</div>
 
 				<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions, a11y_click_events_have_key_events -->
@@ -1023,10 +1310,7 @@
 					ondrop={dropComponent}
 					ondragover={(event) => event.preventDefault()}
 					oncontextmenu={openCanvasMenu}
-					onclick={() => {
-						selectedComponentId = null;
-						selectedWireId = null;
-					}}
+					onclick={clearSelection}
 				>
 					{#if workbench.placed_components.length === 0}
 						<div class="canvas-hint">
@@ -1053,6 +1337,7 @@
 									onclick={(event) => {
 										event.stopPropagation();
 										selectedWireId = wire.id;
+										selectedIds = [];
 										selectedComponentId = null;
 									}}
 									oncontextmenu={(event) => openWireMenu(event, wire)}
@@ -1062,6 +1347,16 @@
 								/>
 							{/if}
 						{/each}
+
+						{#if wiring && wiring.source !== 'schematic' && wiring.moved}
+							{@const start = wireEndpoint(wiring.from)}
+							<path
+								class="wire-ghost"
+								d={`M ${start.x} ${start.y} C ${start.x + 60} ${start.y}, ${
+									wiring.cursor.x - 60
+								} ${wiring.cursor.y}, ${wiring.cursor.x} ${wiring.cursor.y}`}
+							/>
+						{/if}
 					</svg>
 
 					{#each workbench.placed_components as instance (instance.id)}
@@ -1071,52 +1366,49 @@
 								role="button"
 								tabindex="0"
 								aria-label={instance.display_name}
-								class:selected={instance.id === selectedComponentId}
+								class:selected={isSelected(instance.id)}
+								class:primary-select={instance.id === selectedComponentId &&
+									selectedIds.length > 1}
 								class={componentClass(def)}
 								style={`left:${instance.x}px; top:${instance.y}px; width:${def.width}px; height:${def.height}px; --rot:${instance.rotation ?? 0}deg;`}
 								onpointerdown={(event) => startMove(event, instance)}
+								onclick={(event) => event.stopPropagation()}
 								oncontextmenu={(event) => openComponentMenu(event, instance)}
 								onkeydown={(event) => {
-									if (event.key === 'Enter') selectedComponentId = instance.id;
+									if (event.key === 'Enter') selectComponent(instance.id);
 								}}
 							>
 								<div class="part-body">
+									<!-- Vector "template" graphic; pins overlay on top of it. -->
+									<div class="chip-art" aria-hidden="true">
+										{@html background(
+											def.visual_type,
+											def.width,
+											def.height,
+											instance.config
+										)}
+									</div>
 									<div class="part-title">
 										<strong>{instance.display_name}</strong>
 										<small>{def.category}</small>
 									</div>
-
-									{#if def.visual_type === 'blue-pill'}
-										<div class="usb">USB</div>
-										<div class="chip">STM32F103</div>
-										<div class="crystal"></div>
-										<div class="reset">RST</div>
-										<div class="direction">Pin 1</div>
-									{:else if def.visual_type === 'motor'}
-										<div class="motor-body"><span>M</span></div>
-										<div class="shaft"></div>
-									{:else if def.visual_type === 'driver'}
-										<div class="driver-chip">L298N</div>
-										<div class="sink"></div>
-									{:else if def.visual_type === 'led'}
-										<div class="led-glow"></div>
-									{:else if def.visual_type === 'resistor'}
-										<div class="resistor-body"></div>
-									{:else if def.visual_type === 'battery'}
-										<div class="battery-cap"></div>
-										<div class="battery-label">9V</div>
-									{/if}
 								</div>
 
 								{#each def.pins as pin (pin.name)}
+									{@const drag = pinDragState(instance.id, pin.name, pin.role)}
 									<button
+										data-component-id={instance.id}
+										data-pin-name={pin.name}
 										class:armed={pendingPin?.componentId === instance.id &&
 											pendingPin?.pinName === pin.name}
-										class={`pin ${pin.side} role-${pin.role}`}
+										class:wired={pinIsWired(instance.id, pin.name)}
+										class={`pin ${pin.side} role-${pin.role} ${drag}`}
 										style={`left:${pin.x}px; top:${pin.y}px;`}
-										title={`${pin.label} · ${pin.role}`}
+										title={`${pin.label} · ${pin.role}${
+											pinIsWired(instance.id, pin.name) ? ' · wired' : ''
+										}`}
 										aria-label={`Pin ${pin.label}, ${pin.role}`}
-										onclick={(event) => clickPin(event, instance, pin)}
+										onpointerdown={(event) => startWire(event, instance, pin)}
 									>
 										<span>{pin.label}</span>
 									</button>
@@ -1130,30 +1422,91 @@
 			<aside class="schema">
 				<div class="section-title">
 					<h2>Schematic</h2>
-					<span>{workbench.wires.length} wires</span>
+					<span>
+						{selectedIds.length
+							? `${selectedIds.length} selected`
+							: `${schematicComponents.length} parts`}
+						· {workbench.wires.length} wires
+					</span>
 				</div>
-				<div class="schematic">
-					{#if schematicNodes.length === 0}
-						<p class="muted small">Place components to see the netlist.</p>
+
+				<!-- Interactive pin panel: every component is a foldable row of pins.
+				     Drag a pin onto another pin (here or on the workbench) to wire. -->
+				<div class="pin-panel">
+					{#if schematicComponents.length === 0}
+						<p class="muted small">Place a component to list its pins here.</p>
 					{:else}
-						<svg viewBox={`0 0 320 ${schematicHeight}`} aria-label="Netlist diagram">
-							{#each workbench.wires as wire (wire.id)}
-								<path class="schem-wire" d={schematicPath(wire)} stroke={wire.color} />
-							{/each}
-							{#each schematicNodes as node (node.id)}
-								<g
-									class="schem-node"
-									class:selected={node.id === selectedComponentId}
-									onclick={() => (selectedComponentId = node.id)}
-									role="presentation"
+						{#each schematicComponents as instance (instance.id)}
+							{@const def = definition(instance.definition_id)}
+							{#if def}
+								<div
+									class="schem-comp"
+									class:active={isSelected(instance.id)}
 								>
-									<rect x={node.x} y={node.y} width={node.w} height={node.h} rx="6" />
-									<text x={node.x + node.w / 2} y={node.y + node.h / 2 + 4}>
-										{node.name}
-									</text>
-								</g>
-							{/each}
-						</svg>
+									<button
+										class="schem-comp-head"
+										onclick={() => toggleSchematicFold(instance.id)}
+									>
+										<span class="fold" class:closed={schematicCollapsed[instance.id]}
+											>▾</span
+										>
+										<span class={`thumb-mini ${def.thumbnail}`}></span>
+										<span class="schem-comp-name">{instance.display_name}</span>
+										<span class="schem-pin-count">{def.pins.length}</span>
+									</button>
+									{#if !schematicCollapsed[instance.id]}
+										<ul class="schem-pin-list">
+											{#each def.pins as pin (pin.name)}
+												{@const conns = pinConnections(instance.id, pin.name)}
+												{@const drag = pinDragState(
+													instance.id,
+													pin.name,
+													pin.role
+												)}
+												<li>
+													<button
+														data-component-id={instance.id}
+														data-pin-name={pin.name}
+														class={`schem-pin role-${pin.role} ${drag}`}
+														class:wired={conns.length > 0}
+														title={`${pin.label} · ${
+															ROLE_LABEL[pin.role] ?? pin.role
+														} — drag to another pin to wire`}
+														onpointerdown={(event) =>
+															startSchematicWire(event, instance, pin)}
+													>
+														<span
+															class="schem-pin-dot"
+															style={`background:${
+																conns[0]?.color ?? 'transparent'
+															}`}
+														></span>
+														<span class="schem-pin-label">{pin.label}</span>
+														<span class="schem-pin-role"
+															>{ROLE_LABEL[pin.role] ?? pin.role}</span
+														>
+													</button>
+													{#each conns as conn (conn.wireId)}
+														<button
+															class="schem-conn"
+															class:selected={conn.wireId === selectedWireId}
+															onclick={() => (selectedWireId = conn.wireId)}
+															title="Select this wire"
+														>
+															<span
+																class="schem-conn-bar"
+																style={`background:${conn.color}`}
+															></span>
+															<span>→ {conn.label}</span>
+														</button>
+													{/each}
+												</li>
+											{/each}
+										</ul>
+									{/if}
+								</div>
+							{/if}
+						{/each}
 					{/if}
 				</div>
 
@@ -1173,7 +1526,7 @@
 									<td>{pinLabel(wire.to.componentId, wire.to.pinName)}</td>
 								</tr>
 							{:else}
-								<tr><td colspan="2" class="muted">Wire two pins to build the netlist.</td></tr>
+								<tr><td colspan="2" class="muted">Drag pin to pin to build the netlist.</td></tr>
 							{/each}
 						</tbody>
 					</table>
@@ -1181,7 +1534,10 @@
 
 				<div class="inspector">
 					<h3>Inspector</h3>
-					{#if selectedComponent}
+					{#if selectedIds.length > 1}
+						<p><strong>{selectedIds.length} components selected</strong></p>
+						<p class="muted">Rotate, move or delete them together.</p>
+					{:else if selectedComponent}
 						{@const def = definition(selectedComponent.definition_id)}
 						<p><strong>{selectedComponent.display_name}</strong></p>
 						<p class="muted">{def?.description}</p>
@@ -1202,6 +1558,13 @@
 					{/if}
 				</div>
 			</aside>
+
+			<AssistantPanel
+				projectId={selectedProject.id}
+				apiBase={API_BASE}
+				onstatus={(text) => setStatus(text, true)}
+				ondone={onAgentDone}
+			/>
 		</section>
 	{:else if activeView === 'code'}
 		<section class="code-shell" in:fade={{ duration: 150 }}>
@@ -1210,16 +1573,20 @@
 					<h2>Files</h2>
 					<span>{files.length}</span>
 				</div>
-				{#each files as file (file.path)}
-					<button
-						class="file-btn"
-						class:active={file.path === activeFilePath}
-						onclick={() => (activeFilePath = file.path)}
-					>
-						<span>{file.path}</span>
-						<small>{file.language}</small>
-					</button>
-				{/each}
+				<div class="file-list">
+					{#each files as file (file.path)}
+						<button
+							class="file-btn"
+							class:active={file.path === activeFilePath}
+							onclick={() => (activeFilePath = file.path)}
+						>
+							<span>{file.path}</span>
+							<small>{file.language}</small>
+						</button>
+					{:else}
+						<p class="muted small">No files yet — generate firmware to start.</p>
+					{/each}
+				</div>
 				<div class="component-summary">
 					<h3>Hardware</h3>
 					{#each workbench.placed_components as instance (instance.id)}
@@ -1231,6 +1598,17 @@
 			</aside>
 
 			<section class="editor-pane">
+				<!-- Slim contextual hint strip, mirroring the workbench view. -->
+				<div class="editor-hint" class:wiring={fileDirty}>
+					{#if !activeFile}
+						Select a file from the list to start coding
+					{:else if fileDirty}
+						Unsaved edits in {activeFilePath} — Ctrl+S to save
+					{:else}
+						Editing {activeFilePath} · Regenerate rebuilds from the workbench
+					{/if}
+				</div>
+
 				<div class="toolbar">
 					<div class="toolbar-info">
 						<strong>{activeFilePath || 'No file selected'}</strong>
@@ -1284,6 +1662,13 @@
 					workbench changes.
 				</p>
 			</aside>
+
+			<AssistantPanel
+				projectId={selectedProject.id}
+				apiBase={API_BASE}
+				onstatus={(text) => setStatus(text, true)}
+				ondone={onAgentDone}
+			/>
 		</section>
 	{/if}
 </main>
@@ -1407,18 +1792,63 @@
 		overflow: hidden;
 	}
 
-	/* ---- topbar ---- */
+	/* ---- topbar ----
+	   Flex row so the optional workbench action group can appear or vanish
+	   without a fixed grid template breaking. brand stays left, project chip
+	   right; nav + actions sit in the middle. */
 	.topbar {
-		display: grid;
-		grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 0.8fr);
+		display: flex;
 		align-items: center;
 		gap: 1rem;
-		padding: 0.85rem 1.25rem;
+		padding: 0.7rem 1.25rem;
 		border-bottom: 1px solid #2b333d;
 		background: #11151b;
 		position: sticky;
 		top: 0;
 		z-index: 20;
+	}
+
+	.topbar .brand {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+
+	.topbar .project-chip {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
+
+	/* ---- workbench actions in the navbar ---- */
+	.nav-actions {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+		flex-wrap: nowrap;
+	}
+
+	.nav-act {
+		border-color: #343c46;
+		background: #1a1f27;
+		padding: 0.4rem 0.7rem;
+		font-size: 0.82rem;
+		white-space: nowrap;
+	}
+
+	.nav-act.primary {
+		border-color: #4eb79a;
+		background: #1f7a65;
+		color: #eafff8;
+	}
+
+	.nav-act.primary:hover:not(:disabled) {
+		background: #258b73;
+	}
+
+	.nav-sep {
+		width: 1px;
+		height: 22px;
+		background: #2b333d;
+		margin: 0 0.2rem;
 	}
 
 	.brand {
@@ -1584,10 +2014,6 @@
 		font-size: 0.76rem;
 	}
 
-	.toolbar-info span.wiring {
-		color: #74d7bb;
-	}
-
 	.row-actions {
 		display: flex;
 		align-items: center;
@@ -1729,14 +2155,34 @@
 		}
 	}
 
-	/* ---- IDE grid ---- */
+	/* ---- IDE grid ----
+	   Three columns: a left bar that stacks Components over Schematic, the
+	   Workbench in the middle, and the AI agent chat panel on the right.
+	   The left column is split into two rows; the middle and right span both. */
 	.ide-grid {
 		display: grid;
-		grid-template-columns: 290px minmax(520px, 1fr) 340px;
-		/* One full-height row so the three panels stretch to the viewport
-		   bottom instead of collapsing to their content height. */
-		grid-template-rows: 100%;
+		grid-template-columns: 300px minmax(420px, 1fr) 340px;
+		grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
 		gap: 1rem;
+	}
+
+	/* DOM order is palette, workbench, schematic, assistant — each child is
+	   pinned to its cell so the visual layout is independent of source order. */
+	.ide-grid .palette {
+		grid-column: 1;
+		grid-row: 1;
+	}
+	.ide-grid .schema {
+		grid-column: 1;
+		grid-row: 2;
+	}
+	.ide-grid .workbench-panel {
+		grid-column: 2;
+		grid-row: 1 / span 2;
+	}
+	.ide-grid > :global(.assistant) {
+		grid-column: 3;
+		grid-row: 1 / span 2;
 	}
 
 	.palette,
@@ -1752,8 +2198,8 @@
 	}
 
 	.schema {
-		/* title · schematic · netlist (flexes + scrolls) · inspector */
-		grid-template-rows: auto auto 1fr auto;
+		/* title · pin panel (flexes + scrolls) · netlist · inspector */
+		grid-template-rows: auto 1fr auto auto;
 	}
 
 	.search {
@@ -1806,9 +2252,25 @@
 	.workbench-panel {
 		display: grid;
 		grid-template-rows: auto 1fr;
-		gap: 0.7rem;
+		gap: 0.6rem;
 		min-height: 0;
 		height: 100%;
+	}
+
+	/* Slim contextual hint above the canvas — replaces the old toolbar card
+	   now that the action buttons have moved into the navbar. */
+	.workbench-hint {
+		padding: 0.4rem 0.7rem;
+		font-size: 0.76rem;
+		color: #8e9aaa;
+		background: #11151b;
+		border: 1px solid #2b333d;
+		border-radius: 8px;
+	}
+
+	.workbench-hint.wiring {
+		color: #74d7bb;
+		border-color: #2f6b5c;
 	}
 
 	.toolbar {
@@ -1871,7 +2333,7 @@
 		transition: stroke-width 0.1s ease;
 	}
 
-	.wire-layer path:hover {
+	.wire-layer path:not(.wire-ghost):hover {
 		stroke-width: 5.5;
 	}
 
@@ -1880,57 +2342,271 @@
 		filter: drop-shadow(0 0 7px currentColor);
 	}
 
-	/* ---- schematic ---- */
-	.schematic {
-		border: 1px solid #2b333d;
-		background: #171c23;
-		border-radius: 9px;
-		padding: 0.5rem;
-		min-height: 120px;
+	/* in-progress drag-wire preview */
+	.wire-layer path.wire-ghost {
+		fill: none;
+		stroke: #74d7bb;
+		stroke-width: 3;
+		stroke-dasharray: 7 5;
+		stroke-linecap: round;
+		pointer-events: none;
+		opacity: 0.9;
+	}
+
+	/* ---- chip vector template ---- */
+	.chip-art {
+		position: absolute;
+		inset: 0;
 		display: grid;
 		place-items: center;
-	}
-
-	.schematic svg {
-		width: 100%;
-		height: auto;
-	}
-
-	.schem-node rect {
-		fill: #222832;
-		stroke: #526071;
-		transition: fill 0.1s ease, stroke 0.1s ease;
-		cursor: pointer;
-	}
-
-	.schem-node:hover rect {
-		stroke: #74d7bb;
-	}
-
-	.schem-node.selected rect {
-		fill: #17342f;
-		stroke: #74d7bb;
-	}
-
-	.schem-node text {
-		fill: #eef3f8;
-		font-size: 10px;
-		text-anchor: middle;
 		pointer-events: none;
+		z-index: 0;
 	}
 
-	.schem-wire {
-		fill: none;
-		stroke-width: 2;
+	.chip-art :global(svg.chip-symbol) {
+		display: block;
+		width: 100%;
+		height: 100%;
+	}
+
+	/* ---- schematic pin panel ---- */
+	.pin-panel {
+		display: grid;
+		align-content: start;
+		gap: 0.4rem;
+		overflow-y: auto;
+		min-height: 0;
+		padding-right: 0.2rem;
+	}
+
+	.schem-comp {
+		border: 1px solid #2b333d;
+		background: #171c23;
+		border-radius: 8px;
+		overflow: hidden;
+	}
+
+	.schem-comp.active {
+		border-color: #2f6b5c;
+	}
+
+	.schem-comp-head {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		width: 100%;
+		border: none;
+		border-radius: 0;
+		background: #1c2330;
+		padding: 0.45rem 0.55rem;
+		text-align: left;
+	}
+
+	.schem-comp-head:hover:not(:disabled) {
+		background: #232c3a;
+	}
+
+	.fold {
+		font-size: 0.7rem;
+		color: #8e9aaa;
+		transition: transform 0.12s ease;
+	}
+
+	.fold.closed {
+		transform: rotate(-90deg);
+	}
+
+	.thumb-mini {
+		width: 22px;
+		height: 16px;
+		border: 1px solid #3d4653;
+		border-radius: 4px;
+		background: #27313d;
+		flex-shrink: 0;
+	}
+	.thumb-mini.board {
+		background: linear-gradient(90deg, #244e8f 0 72%, #b8c4cf 72% 88%, #11151b 88%);
+	}
+	.thumb-mini.motor {
+		border-radius: 50%;
+		background: radial-gradient(circle, #d7dde5 0 38%, #6b7787 39% 58%, #222832 59%);
+	}
+	.thumb-mini.driver {
+		background: repeating-linear-gradient(90deg, #233044 0 4px, #18202a 4px 8px);
+	}
+	.thumb-mini.led {
+		background: radial-gradient(circle, #ff667a 0 28%, #55242c 29% 58%, #171c23 59%);
+	}
+	.thumb-mini.resistor {
+		background: linear-gradient(90deg, #9ca3af 0 20%, #d8b76a 20% 80%, #9ca3af 80%);
+	}
+	.thumb-mini.battery {
+		background: linear-gradient(180deg, #5a606b, #202630);
+	}
+
+	.schem-comp-name {
+		flex: 1;
+		font-size: 0.8rem;
+		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.schem-pin-count {
+		font-size: 0.66rem;
+		color: #8e9aaa;
+		background: #11151b;
+		border-radius: 10px;
+		padding: 0.05rem 0.4rem;
+	}
+
+	.schem-pin-list {
+		list-style: none;
+		margin: 0;
+		padding: 0.3rem;
+		display: grid;
+		gap: 0.2rem;
+	}
+
+	.schem-pin {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		width: 100%;
+		border: 1px solid #2b333d;
+		border-radius: 6px;
+		background: #11151b;
+		padding: 0.32rem 0.45rem;
+		text-align: left;
+		cursor: grab;
+		touch-action: none;
+	}
+
+	.schem-pin:active {
+		cursor: grabbing;
+	}
+
+	.schem-pin:hover {
+		border-color: #45505d;
+	}
+
+	.schem-pin-dot {
+		width: 9px;
+		height: 9px;
+		border-radius: 50%;
+		border: 1px solid #3d4653;
+		flex-shrink: 0;
+	}
+
+	.schem-pin-label {
+		flex: 1;
+		font-size: 0.76rem;
+		font-weight: 700;
+	}
+
+	.schem-pin-role {
+		font-size: 0.62rem;
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+		color: #8e9aaa;
+	}
+
+	/* role accent stripe on the left of a schematic pin row */
+	.schem-pin.role-power {
+		border-left: 3px solid #f6c560;
+	}
+	.schem-pin.role-ground {
+		border-left: 3px solid #8995a4;
+	}
+	.schem-pin.role-pwm {
+		border-left: 3px solid #a78bfa;
+	}
+	.schem-pin.role-motor {
+		border-left: 3px solid #f59e0b;
+	}
+	.schem-pin.role-input {
+		border-left: 3px solid #60a5fa;
+	}
+	.schem-pin.role-output {
+		border-left: 3px solid #52d1a4;
+	}
+	.schem-pin.role-gpio {
+		border-left: 3px solid #e7edf4;
+	}
+	.schem-pin.role-passive {
+		border-left: 3px solid #c7cfd9;
+	}
+
+	.schem-pin.wired {
+		background: #15211f;
+	}
+
+	/* live drag-target highlight, shared by workbench + schematic pins */
+	.schem-pin.compat-ideal,
+	.pin.compat-ideal {
+		box-shadow: 0 0 0 2px #52d1a4, 0 0 10px rgb(82 209 164 / 0.5);
+	}
+	.schem-pin.compat-ok,
+	.pin.compat-ok {
+		box-shadow: 0 0 0 2px #f6c560, 0 0 10px rgb(246 197 96 / 0.45);
+	}
+	.schem-pin.compat-warn,
+	.pin.compat-warn {
+		box-shadow: 0 0 0 2px #f87171, 0 0 9px rgb(248 113 113 / 0.4);
+		opacity: 0.78;
+	}
+	.schem-pin.compat-self,
+	.pin.compat-self {
+		opacity: 0.45;
+	}
+
+	.schem-conn {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		width: 100%;
+		border: none;
+		border-radius: 5px;
+		background: transparent;
+		padding: 0.18rem 0.45rem 0.18rem 1.4rem;
+		text-align: left;
+		font-size: 0.7rem;
+		color: #9aa6b5;
+	}
+
+	.schem-conn:hover {
+		background: #161d24;
+	}
+
+	.schem-conn.selected {
+		background: #17342f;
+		color: #d4dce5;
+	}
+
+	.schem-conn-bar {
+		width: 14px;
+		height: 3px;
+		border-radius: 2px;
+		flex-shrink: 0;
+	}
+
+	/* ---- workbench pin states ---- */
+	.pin.wired {
+		box-shadow: 0 0 0 2px rgb(116 215 187 / 0.55);
 	}
 
 	.netlist {
 		display: grid;
-		grid-template-rows: auto 1fr;
+		grid-template-rows: auto auto;
 		gap: 0.4rem;
 		min-height: 0;
+		/* Capped so the pin panel above keeps the flexible space. */
+		max-height: 28vh;
 		overflow-y: auto;
 		align-content: start;
+		border-top: 1px solid #2b333d;
+		padding-top: 0.6rem;
 	}
 
 	.netlist h3,
@@ -2004,21 +2680,43 @@
 	/* ---- code view ---- */
 	.code-shell {
 		display: grid;
-		grid-template-columns: 250px minmax(500px, 1fr) 290px;
+		/* files · editor · project settings · AI agent panel */
+		grid-template-columns: 230px minmax(420px, 1fr) 260px 320px;
 		grid-template-rows: 100%;
 		gap: 1rem;
 	}
 
-	.file-tree,
+	/* Mirror the workbench's .palette / .schema framing: a fixed section-title
+	   row, a flexible scrolling body, then pinned sub-sections — the panel
+	   itself never scrolls. */
+	.file-tree {
+		display: grid;
+		grid-template-rows: auto 1fr auto;
+		gap: 0.7rem;
+		padding: 1rem;
+		min-height: 0;
+		height: 100%;
+		overflow: hidden;
+	}
+
 	.settings-panel {
 		display: grid;
 		align-content: start;
-		gap: 0.65rem;
+		gap: 0.7rem;
 		padding: 1rem;
-		/* Fill the row; scroll internally if the file list is long. */
 		min-height: 0;
 		height: 100%;
 		overflow-y: auto;
+	}
+
+	/* Scrolling file list, like the workbench's .component-list. */
+	.file-list {
+		display: grid;
+		align-content: start;
+		gap: 0.45rem;
+		overflow-y: auto;
+		min-height: 0;
+		padding-right: 0.2rem;
 	}
 
 	.file-btn {
@@ -2027,6 +2725,7 @@
 		gap: 0.75rem;
 		text-align: left;
 		align-items: center;
+		padding: 0.55rem 0.65rem;
 	}
 
 	.file-btn small {
@@ -2036,7 +2735,6 @@
 	}
 
 	.component-summary {
-		margin-top: 0.4rem;
 		display: grid;
 		gap: 0.35rem;
 		color: #aeb8c6;
@@ -2053,9 +2751,25 @@
 	.editor-pane {
 		min-height: 0;
 		display: grid;
-		grid-template-rows: auto 1fr;
-		gap: 0.7rem;
+		/* hint strip · toolbar · editor — matching the workbench panel layout */
+		grid-template-rows: auto auto 1fr;
+		gap: 0.6rem;
 		height: 100%;
+	}
+
+	/* Slim contextual hint above the editor — shares the workbench-hint look. */
+	.editor-hint {
+		padding: 0.4rem 0.7rem;
+		font-size: 0.76rem;
+		color: #8e9aaa;
+		background: #11151b;
+		border: 1px solid #2b333d;
+		border-radius: 8px;
+	}
+
+	.editor-hint.wiring {
+		color: #f5b95c;
+		border-color: #7a5a26;
 	}
 
 	.editor-pane > :global(.editor) {
@@ -2097,6 +2811,20 @@
 	}
 
 	/* ---- responsive ---- */
+	/* Below ~1580px the four-column Code grid is cramped: drop its AI panel to
+	   a full-width row beneath the rest. The Workbench grid (one left bar, a
+	   wide canvas, one right panel) stays comfortable down to the 1180px
+	   single-column breakpoint, so it needs no intermediate rule. */
+	@media (max-width: 1580px) and (min-width: 1181px) {
+		.code-shell {
+			grid-template-columns: 230px minmax(420px, 1fr) 260px;
+			grid-template-rows: 1fr auto;
+		}
+		.code-shell > :global(.assistant) {
+			grid-column: 1 / -1;
+		}
+	}
+
 	@media (max-width: 1180px) {
 		.dashboard,
 		.ide-grid,
@@ -2104,19 +2832,28 @@
 			grid-template-columns: 1fr;
 		}
 
-		.topbar {
-			grid-template-columns: 1fr auto;
-			grid-template-areas: 'brand chip' 'nav nav';
+		/* Single column: clear the explicit column/row pins and the two-row
+		   template so every panel simply stacks in source order. */
+		.ide-grid {
+			grid-template-rows: none;
+			grid-auto-rows: auto;
+		}
+		.ide-grid > :global(.assistant),
+		.ide-grid .palette,
+		.ide-grid .schema,
+		.ide-grid .workbench-panel {
+			grid-column: auto;
+			grid-row: auto;
 		}
 
-		.brand {
-			grid-area: brand;
+		/* Narrow: let the topbar wrap so brand + chip share the top line and
+		   nav / actions flow onto the next. */
+		.topbar {
+			flex-wrap: wrap;
 		}
-		nav {
-			grid-area: nav;
-		}
-		.project-chip {
-			grid-area: chip;
+		.topbar nav,
+		.nav-actions {
+			order: 3;
 		}
 
 		.palette,

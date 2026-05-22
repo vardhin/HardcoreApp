@@ -70,6 +70,45 @@ CORS accepts any local `localhost`/`127.0.0.1` port in the `51xx` range.
    `src/main.c`.
 4. **Code** — edit any file with syntax highlighting and save.
 
+## AI agent
+
+The **AI Agent** panel docks on the Workbench and Code pages. Type a hardware
+problem statement, pick an LLM provider, and press **Solve** — the backend runs
+a two-phase agent:
+
+1. **Wiring** — an isolated agent context sees the problem, the catalogue, and
+   the current workbench. It places components and wires their pins.
+2. **Coding** — a brand-new context sees only the *finished* netlist and writes
+   firmware into `src/main.c`.
+
+Each phase's `THINK` / `CALL` trace is streamed back to the panel. Tools mutate
+Supabase directly, so the workbench and editor just re-fetch when the run ends.
+
+The agent uses a C-style tool-calling protocol (`CALL place_component("led-red")`)
+instead of JSON — fewer tokens and far more reliable for small/local models.
+
+In the coding phase the agent can patch files surgically rather than rewriting
+them. `file_edit` (backed by `backend/editmatch.py`) anchors on a before-block —
+the changed lines plus one unchanged context line above and below — and refuses
+to act if that anchor matches zero or many places, so a stale edit fails loudly.
+It accepts an inline form, `file_edit(path, old, new)`, or a paired form: a bare
+`CALL file_edit("src/main.c")` followed by two fenced ``` blocks (before, then
+after). Matching tolerates a copied `N|` line-number gutter and indentation
+drift.
+
+### Providers
+
+Configured in `backend/.env` (see `.env.example`). Pick per request from the panel:
+
+| Provider | Model | Key |
+| --- | --- | --- |
+| `llamacpp` | Prism Bonsai 8B (1-bit quant) | none — local server on `LLAMACPP_URL` |
+| `openrouter` | `openai/gpt-oss-120b` | `OPENROUTER_API_KEY` |
+| `gemini` | `gemini-2.5-flash` | `GEMINI_API_KEY` |
+
+For `llamacpp`, run an OpenAI-compatible server, e.g.
+`llama-server -m prism-bonsai-8b-q1.gguf --port 8080`.
+
 ## Keyboard
 
 - `Del` / `Backspace` — delete selected component or wire
@@ -99,3 +138,5 @@ Right-clicking surfaces an app-specific menu instead of the browser default:
 | GET | `/api/projects/{id}/files` | List code files |
 | PUT | `/api/projects/{id}/files/{path}` | Upsert a file |
 | POST | `/api/projects/{id}/generate` | Generate firmware from the netlist |
+| GET | `/api/agent/providers` | Which LLM providers are configured |
+| POST | `/api/projects/{id}/agent/solve` | Run the two-phase AI agent |

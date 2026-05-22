@@ -1,0 +1,386 @@
+"""The Toolbox: the concrete tools the agent calls in each phase.
+
+A Toolbox is constructed per agent run with the project, its DB session, the
+component catalogue, and a working copy of the workbench. Tools mutate that
+working copy (and, in phase 2, code-file content) in memory; the caller commits
+once the phase finishes.
+
+Two tool sets:
+  WiringToolbox — place/move/rotate/remove components, wire/unwire pins.
+  CodingToolbox — inspect the finished netlist, read/write code files.
+
+Both share read-only inspection tools so the model can always re-orient itself.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import editmatch
+from agent import ToolSpec, tool
+
+# ---------------------------------------------------------------------------
+# Base toolbox — shared inspection tools + the working workbench copy.
+# ---------------------------------------------------------------------------
+
+
+class Toolbox:
+    """Holds per-run state and exposes tools as bound methods.
+
+    `workbench` is a mutable dict {placed_components, wires, viewport}. `catalogue`
+    maps slug -> ComponentDefinition (the pydantic model from main.py). Subclasses
+    add phase-specific tools; `specs()` collects every @tool method on the class.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_name: str,
+        problem: str,
+        catalogue: dict[str, Any],
+        workbench: dict[str, Any],
+        files: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
+        self.project_name = project_name
+        self.problem = problem
+        self.catalogue = catalogue
+        self.workbench = workbench
+        # files: path -> {"language": str, "content": str}
+        self.files = files or {}
+        # Set by run_phase before invoking a wants_body tool: the verbatim text
+        # following the CALL line, from which file_edit parses its ``` fences.
+        self.call_body = ""
+
+    # -- registry --------------------------------------------------------
+
+    @classmethod
+    def specs(cls) -> list[ToolSpec]:
+        """Every @tool method on this class (and its bases), declaration order."""
+        seen: dict[str, ToolSpec] = {}
+        for klass in reversed(cls.__mro__):
+            for name, member in vars(klass).items():
+                spec = getattr(member, "_tool_spec", None)
+                if spec is not None:
+                    seen[name] = spec
+        return list(seen.values())
+
+    # -- helpers (not tools) --------------------------------------------
+
+    def _find_component(self, ref: str) -> dict[str, Any] | None:
+        """Resolve a component reference: its id, or its display name (case-insensitive)."""
+        ref = str(ref).strip()
+        for c in self.workbench["placed_components"]:
+            if c["id"] == ref:
+                return c
+        low = ref.lower()
+        matches = [c for c in self.workbench["placed_components"] if c["display_name"].lower() == low]
+        return matches[0] if len(matches) == 1 else None
+
+    def _definition(self, slug: str) -> Any | None:
+        return self.catalogue.get(slug)
+
+    def _pin_exists(self, component: dict[str, Any], pin_name: str) -> bool:
+        definition = self._definition(component.get("definition_id", ""))
+        if not definition:
+            return False
+        return any(p.name == pin_name for p in definition.pins)
+
+    def _describe_component(self, c: dict[str, Any]) -> str:
+        definition = self._definition(c.get("definition_id", ""))
+        pins = ", ".join(p.name for p in definition.pins) if definition else "?"
+        return (
+            f"[{c['id']}] {c['display_name']} ({c.get('definition_id')}) "
+            f"at ({int(c['x'])},{int(c['y'])}) rot {c.get('rotation', 0)} — pins: {pins}"
+        )
+
+    # -- shared inspection tools ----------------------------------------
+
+    @tool
+    def show_problem(self) -> str:
+        """Re-read the hardware problem statement you must solve."""
+        return self.problem or "(no problem statement provided)"
+
+    @tool
+    def list_workbench(self) -> str:
+        """List every component currently placed on the workbench, with their pins."""
+        comps = self.workbench["placed_components"]
+        if not comps:
+            return "Workbench is empty."
+        lines = [self._describe_component(c) for c in comps]
+        return f"{len(comps)} component(s):\n" + "\n".join(lines)
+
+    @tool
+    def list_wires(self) -> str:
+        """List every wire (pin-to-pin connection) currently on the workbench."""
+        wires = self.workbench["wires"]
+        if not wires:
+            return "No wires yet."
+        out = []
+        for w in wires:
+            out.append(
+                f"[{w['id']}] {w['from']['componentId']}.{w['from']['pinName']} "
+                f"-> {w['to']['componentId']}.{w['to']['pinName']}"
+            )
+        return f"{len(wires)} wire(s):\n" + "\n".join(out)
+
+    @tool
+    def describe_component(self, component: str) -> str:
+        """Show one placed component's details and the role of each of its pins."""
+        c = self._find_component(component)
+        if not c:
+            return f"No placed component matches '{component}'. Use list_workbench."
+        definition = self._definition(c.get("definition_id", ""))
+        if not definition:
+            return self._describe_component(c)
+        pins = "\n".join(
+            f"  {p.name} (label '{p.label}', role {p.role}, side {p.side})"
+            for p in definition.pins
+        )
+        return f"{self._describe_component(c)}\nPins:\n{pins}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — WIRING toolbox
+# ---------------------------------------------------------------------------
+
+
+class WiringToolbox(Toolbox):
+    """Place components and wire their pins to satisfy the problem statement."""
+
+    @tool
+    def list_catalogue(self) -> str:
+        """List every component type available in the catalogue to place."""
+        lines = []
+        for slug, definition in self.catalogue.items():
+            pins = ", ".join(f"{p.name}:{p.role}" for p in definition.pins)
+            lines.append(f"  {slug} — {definition.name} ({definition.category}); pins: {pins}")
+        return "Catalogue:\n" + "\n".join(lines)
+
+    @tool
+    def place_component(self, slug: str, name: str = "", x: int = 480, y: int = 280) -> str:
+        """Place a catalogue component on the workbench. slug from list_catalogue."""
+        definition = self._definition(slug)
+        if not definition:
+            return f"Unknown slug '{slug}'. Use list_catalogue for valid slugs."
+        # Clamp to the same 1600x1000 canvas the frontend uses.
+        cx = max(0, min(int(x), 1600 - definition.width))
+        cy = max(0, min(int(y), 1000 - definition.height))
+        instance = {
+            "id": f"part-{uuid.uuid4()}",
+            "definition_id": slug,
+            "display_name": name.strip() or definition.name,
+            "x": cx,
+            "y": cy,
+            "rotation": 0,
+            "config": {},
+        }
+        self.workbench["placed_components"].append(instance)
+        return f"Placed {instance['display_name']} as [{instance['id']}] at ({cx},{cy})."
+
+    @tool
+    def move_component(self, component: str, x: int, y: int) -> str:
+        """Move a placed component to a new (x, y) position on the canvas."""
+        c = self._find_component(component)
+        if not c:
+            return f"No placed component matches '{component}'."
+        definition = self._definition(c.get("definition_id", ""))
+        w = definition.width if definition else 140
+        h = definition.height if definition else 100
+        c["x"] = max(0, min(int(x), 1600 - w))
+        c["y"] = max(0, min(int(y), 1000 - h))
+        return f"Moved {c['display_name']} to ({c['x']},{c['y']})."
+
+    @tool
+    def rotate_component(self, component: str) -> str:
+        """Rotate a placed component 90 degrees clockwise."""
+        c = self._find_component(component)
+        if not c:
+            return f"No placed component matches '{component}'."
+        c["rotation"] = (int(c.get("rotation", 0)) + 90) % 360
+        return f"Rotated {c['display_name']} to {c['rotation']} degrees."
+
+    @tool
+    def rename_component(self, component: str, name: str) -> str:
+        """Give a placed component a clearer instance name."""
+        c = self._find_component(component)
+        if not c:
+            return f"No placed component matches '{component}'."
+        old = c["display_name"]
+        c["display_name"] = name.strip() or old
+        return f"Renamed '{old}' to '{c['display_name']}'."
+
+    @tool
+    def remove_component(self, component: str) -> str:
+        """Remove a placed component and every wire attached to it."""
+        c = self._find_component(component)
+        if not c:
+            return f"No placed component matches '{component}'."
+        cid = c["id"]
+        self.workbench["placed_components"] = [
+            x for x in self.workbench["placed_components"] if x["id"] != cid
+        ]
+        before = len(self.workbench["wires"])
+        self.workbench["wires"] = [
+            w for w in self.workbench["wires"]
+            if w["from"]["componentId"] != cid and w["to"]["componentId"] != cid
+        ]
+        dropped = before - len(self.workbench["wires"])
+        return f"Removed {c['display_name']} and {dropped} attached wire(s)."
+
+    @tool
+    def add_wire(self, from_component: str, from_pin: str, to_component: str, to_pin: str) -> str:
+        """Wire one pin to another. Pin names come from describe_component."""
+        a = self._find_component(from_component)
+        b = self._find_component(to_component)
+        if not a:
+            return f"No placed component matches '{from_component}'."
+        if not b:
+            return f"No placed component matches '{to_component}'."
+        if not self._pin_exists(a, from_pin):
+            return f"{a['display_name']} has no pin '{from_pin}'. Use describe_component."
+        if not self._pin_exists(b, to_pin):
+            return f"{b['display_name']} has no pin '{to_pin}'. Use describe_component."
+        if a["id"] == b["id"] and from_pin == to_pin:
+            return "A pin cannot wire to itself."
+        # Reject an exact duplicate (either direction).
+        for w in self.workbench["wires"]:
+            ends = {
+                (w["from"]["componentId"], w["from"]["pinName"]),
+                (w["to"]["componentId"], w["to"]["pinName"]),
+            }
+            if ends == {(a["id"], from_pin), (b["id"], to_pin)}:
+                return "Those two pins are already wired together."
+        wire = {
+            "id": f"wire-{uuid.uuid4()}",
+            "from": {"componentId": a["id"], "pinName": from_pin},
+            "to": {"componentId": b["id"], "pinName": to_pin},
+        }
+        self.workbench["wires"].append(wire)
+        return (
+            f"Wired {a['display_name']}.{from_pin} -> {b['display_name']}.{to_pin} "
+            f"as [{wire['id']}]."
+        )
+
+    @tool
+    def remove_wire(self, wire_id: str) -> str:
+        """Delete a wire by its id (shown in list_wires)."""
+        before = len(self.workbench["wires"])
+        self.workbench["wires"] = [w for w in self.workbench["wires"] if w["id"] != str(wire_id)]
+        if len(self.workbench["wires"]) == before:
+            return f"No wire with id '{wire_id}'."
+        return f"Removed wire {wire_id}."
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — CODING toolbox
+# ---------------------------------------------------------------------------
+
+
+class CodingToolbox(Toolbox):
+    """Inspect the finished netlist and write STM32 firmware into the code files."""
+
+    @tool
+    def list_files(self) -> str:
+        """List the project's code files and their sizes."""
+        if not self.files:
+            return "No code files."
+        return "\n".join(
+            f"  {path} ({meta.get('language', 'c')}, {len(meta.get('content', ''))} chars)"
+            for path, meta in self.files.items()
+        )
+
+    @tool
+    def read_file(self, path: str) -> str:
+        """Read a code file, with a 'N| ' line-number gutter on each line."""
+        meta = self.files.get(path)
+        if meta is None:
+            return f"No file '{path}'. Use list_files."
+        content = meta.get("content", "")
+        lines = content.split("\n")
+        width = len(str(len(lines)))
+        # The gutter is for the model's reference only — file_edit strips a
+        # copied "N| " prefix back off before matching, so anchors still work.
+        return "\n".join(f"{str(i + 1).rjust(width)}| {ln}" for i, ln in enumerate(lines))
+
+    @tool
+    def write_file(self, path: str, content: str) -> str:
+        """Replace a code file's content entirely. Use only for a new file or a full rewrite."""
+        language = "markdown" if path.endswith(".md") else "c"
+        existing = self.files.get(path)
+        if existing is not None:
+            language = existing.get("language", language)
+        self.files[path] = {"language": language, "content": content}
+        return f"Wrote {len(content)} chars to {path}."
+
+    @tool(wants_body=True)
+    def file_edit(self, path: str, old: str = "", new: str = "") -> str:
+        """Edit part of a file: keep one unchanged context line above and below the change.
+
+        Two ways to call it. Inline, for a short single-line fix:
+            CALL file_edit("src/main.c", "old context+line", "new context+line")
+        Or paired, best for multi-line edits — put TWO ``` blocks after the CALL,
+        first the before block, then the after block (repeat for more sites):
+            CALL file_edit("src/main.c")
+            ```c
+            <context line>
+            <original lines>
+            <context line>
+            ```
+            ```c
+            <context line>
+            <changed lines>
+            <context line>
+            ```
+        The before block must match the file exactly and uniquely — include
+        enough surrounding lines that it appears only once.
+        """
+        meta = self.files.get(path)
+        if meta is None:
+            return f"No file '{path}'. Use list_files."
+
+        # Inline form takes priority when old/new were given as args; otherwise
+        # parse the ``` fence pairs the agent captured after the CALL line.
+        if old or new:
+            edits = [editmatch.Edit(old=old, new=new)]
+        else:
+            edits, parse_err = editmatch.parse_edits(self.call_body or "")
+            if parse_err is not None:
+                return f"ERROR: {parse_err}"
+
+        content, results = editmatch.apply_all(meta["content"], edits)
+        applied = [r for r in results if r.applied]
+        failed = next((r for r in results if r.error is not None), None)
+
+        if failed is not None:
+            # apply_all keeps earlier successes in `content`; persist them so
+            # the model sees partial progress, then report the failing site.
+            if applied:
+                meta["content"] = content
+            done = f"{len(applied)} edit(s) applied; " if applied else ""
+            return f"ERROR: {done}edit #{len(applied) + 1} failed: {failed.error}"
+
+        meta["content"] = content
+        spans = ", ".join(f"L{r.start_line}-{r.end_line}" for r in applied)
+        return f"Applied {len(applied)} edit(s) to {path} ({spans})."
+
+    @tool
+    def netlist(self) -> str:
+        """Show the full netlist: every wire with both endpoints' component + pin role."""
+        wires = self.workbench["wires"]
+        if not wires:
+            return "Netlist is empty — no wires."
+        by_id = {c["id"]: c for c in self.workbench["placed_components"]}
+
+        def endpoint(e: dict[str, Any]) -> str:
+            c = by_id.get(e["componentId"])
+            if not c:
+                return f"?.{e['pinName']}"
+            definition = self._definition(c.get("definition_id", ""))
+            pin = next((p for p in definition.pins if p.name == e["pinName"]), None) if definition else None
+            label = pin.label if pin else e["pinName"]
+            role = pin.role if pin else "?"
+            return f"{c['display_name']}.{label}({role})"
+
+        lines = [f"  {endpoint(w['from'])} <-> {endpoint(w['to'])}" for w in wires]
+        return f"Netlist ({len(wires)} connections):\n" + "\n".join(lines)

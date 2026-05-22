@@ -1,0 +1,342 @@
+"""The HardcoreAI agent: a C-style tool-calling loop over the workbench.
+
+Adapted from the project's tool-calling reference (THINK / CALL protocol, no
+JSON). The agent runs in two isolated phases, each with its own fresh context
+window:
+
+  Phase 1 — WIRING:  the model sees the problem statement, the placed
+                     components and their pins, the current wires, and the
+                     component catalogue. It places parts and draws wires.
+  Phase 2 — CODING:  a brand-new context. The model sees the same problem plus
+                     the *finished* netlist, and writes firmware into src/main.c.
+
+Tools mutate Supabase directly through the same helpers the REST API uses
+(`write_workbench`, code-file upsert), so the database stays the single source
+of truth and the frontend just re-fetches when the agent finishes.
+
+Why C-style calls instead of JSON: small/local models (the llama.cpp Prism
+Bonsai 1-bit quant in particular) produce `CALL name("a", b)` far more reliably
+than nested JSON, and it costs fewer tokens.
+"""
+
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# 1. PARSE ERRORS + C-STYLE CALL PARSER
+# ---------------------------------------------------------------------------
+
+
+class ParseError(Exception):
+    """A CALL line could not be parsed into a known tool invocation."""
+
+
+# Backslash-escape translations inside a quoted string argument.
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r"}
+
+
+def _tokenize(args_str: str) -> list[Any]:
+    """Split a C-style arg list into Python values.
+
+    Handles "double-quoted strings" with backslash escapes, bare tokens
+    separated by commas, and coerces bare ints/floats/bools/None. A `key: value`
+    prefix (some models emit named args) is stripped down to the value.
+    """
+    tokens: list[Any] = []
+    i, n = 0, len(args_str)
+    while i < n:
+        while i < n and args_str[i] in " \t,":
+            i += 1
+        if i >= n:
+            break
+        if args_str[i] == '"':
+            i += 1
+            parts: list[str] = []
+            while i < n and args_str[i] != '"':
+                if args_str[i] == "\\" and i + 1 < n:
+                    # Translate the standard escapes: \n \t \r become real
+                    # control chars (multi-line file_edit args rely on this);
+                    # any other \x collapses to x (covers \" and \\).
+                    parts.append(_ESCAPES.get(args_str[i + 1], args_str[i + 1]))
+                    i += 2
+                else:
+                    parts.append(args_str[i])
+                    i += 1
+            if i < n:
+                i += 1  # consume closing quote
+            tokens.append("".join(parts))
+        else:
+            start = i
+            depth = 0
+            # Bare token runs until a top-level comma or close paren.
+            while i < n:
+                ch = args_str[i]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    break
+                i += 1
+            raw = args_str[start:i].strip()
+            colon = raw.find(":")
+            if colon != -1:
+                key = raw[:colon].strip()
+                if key and " " not in key and not key[:1].isdigit():
+                    raw = raw[colon + 1:].strip().strip('"')
+            tokens.append(_coerce(raw))
+    return tokens
+
+
+def _coerce(raw: str) -> Any:
+    """Best-effort cast of a bare token to bool/int/float/None, else keep str."""
+    if len(raw) >= 2 and raw[1] == ":" and raw[0] in "sifb":
+        raw = raw[2:]  # strip type prefixes some models echo: s:foo i:5
+    low = raw.lower()
+    if low == "true":
+        return True
+    if low in ("false",):
+        return False
+    if low in ("null", "none"):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# 2. TOOL REGISTRY
+#
+# Tools are plain methods on a Toolbox subclass. Each is wrapped by @tool, which
+# records its name, docstring, and parameter signature (read via `inspect`).
+# Methods are bound to a toolbox instance per run, so a tool can touch the DB
+# session and the project it was constructed with.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolSpec:
+    name: str
+    description: str
+    params: list[tuple[str, str]]  # (name, type-name) in declaration order
+    func: Callable
+    wants_body: bool = False  # true if the tool consumes post-CALL fenced text
+
+
+def tool(func: Callable = None, *, wants_body: bool = False) -> Callable:
+    """Mark a Toolbox method as an LLM-callable tool.
+
+    The C-like signature shown to the model is derived from the annotations;
+    `self` is skipped. The docstring's first line becomes the description.
+
+    `wants_body=True` declares that the tool consumes the text that follows its
+    CALL line (the ``` fence pairs of the Paired wire format). The agent loop
+    hands that text to the toolbox before invoking the tool — see run_phase.
+    """
+    if func is None:  # called as @tool(wants_body=True)
+        return lambda f: _make_tool(f, wants_body)
+    return _make_tool(func, wants_body)
+
+
+def _make_tool(func: Callable, wants_body: bool) -> Callable:
+    sig = inspect.signature(func)
+    params: list[tuple[str, str]] = []
+    for pname, p in sig.parameters.items():
+        if pname == "self":
+            continue
+        ann = p.annotation
+        # `from __future__ import annotations` makes annotations strings, so an
+        # annotation is either a type object (has __name__) or already a string.
+        if ann is inspect.Parameter.empty:
+            type_name = "str"
+        elif isinstance(ann, str):
+            type_name = ann
+        else:
+            type_name = getattr(ann, "__name__", "str")
+        if type_name not in ("str", "int", "float", "bool"):
+            type_name = "str"
+        params.append((pname, type_name))
+    func._tool_spec = ToolSpec(  # type: ignore[attr-defined]
+        name=func.__name__,
+        description=(func.__doc__ or "").strip().splitlines()[0].strip(),
+        params=params,
+        func=func,
+        wants_body=wants_body,
+    )
+    return func
+
+
+def build_tool_block(specs: list[ToolSpec]) -> str:
+    """Render tool specs as C-like signatures for the system prompt."""
+    lines = []
+    for spec in specs:
+        sig = ", ".join(f"{n}:{t}" for n, t in spec.params)
+        lines.append(f"  {spec.name}({sig})  // {spec.description}")
+    return "\n".join(lines)
+
+
+def parse_call(
+    raw: str, specs_by_name: dict[str, ToolSpec]
+) -> tuple[str, str, dict[str, Any], str] | None:
+    """Scan a model reply for the first THINK/CALL pair.
+
+    Returns (thought, tool_name, kwargs, body), or None when no parsable CALL is
+    present — in which case `raw` is the model's final answer for the phase.
+
+    `body` is the verbatim text *after* the CALL line to the end of the reply;
+    a tool with `wants_body` (file_edit) parses its ``` fence pairs out of it.
+    """
+    thought = ""
+    lines = raw.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.upper().startswith("THINK:"):
+            thought = stripped[6:].strip()
+            continue
+
+        call_str: str | None = None
+        if stripped.upper().startswith("CALL"):
+            call_str = stripped[4:].lstrip(":= ").strip()
+        elif "<|tool_call>" in stripped:  # tolerate model-specific sentinels
+            call_str = stripped.split("<|tool_call>", 1)[1].lstrip("call:Call ").strip()
+
+        if call_str:
+            try:
+                name, kwargs = _parse_one(call_str, specs_by_name)
+            except ParseError:
+                continue
+            body = "".join(lines[i + 1:])
+            return thought, name, kwargs, body
+    return None
+
+
+def _parse_one(
+    call_str: str, specs_by_name: dict[str, ToolSpec]
+) -> tuple[str, dict[str, Any]]:
+    """Parse a single `name(arg1, arg2, ...)` against a tool's parameter order."""
+    open_idx = call_str.find("(")
+    if open_idx == -1:
+        raise ParseError(f"no '(' in call: {call_str}")
+    name = call_str[:open_idx].strip()
+    if name not in specs_by_name:
+        raise ParseError(f"unknown tool: {name}")
+    if not call_str.rstrip().endswith(")"):
+        raise ParseError(f"no closing ')' in call: {call_str}")
+
+    args_str = call_str[open_idx + 1:call_str.rstrip().rfind(")")].strip()
+    tokens = _tokenize(args_str) if args_str else []
+
+    spec = specs_by_name[name]
+    if len(tokens) > len(spec.params):
+        raise ParseError(f"too many args for {name}")
+    kwargs: dict[str, Any] = {}
+    for (pname, ptype), value in zip(spec.params, tokens):
+        kwargs[pname] = _cast(value, ptype)
+    return name, kwargs
+
+
+def _cast(value: Any, type_name: str) -> Any:
+    """Coerce a parsed token to the parameter's declared type, leniently."""
+    try:
+        if type_name == "int":
+            return int(value)
+        if type_name == "float":
+            return float(value)
+        if type_name == "bool":
+            return value if isinstance(value, bool) else str(value).lower() in ("1", "true", "yes")
+        return str(value)
+    except (TypeError, ValueError):
+        return value
+
+
+# ---------------------------------------------------------------------------
+# 3. AGENT LOOP
+# ---------------------------------------------------------------------------
+
+MAX_STEPS = 16
+
+
+@dataclass
+class AgentTrace:
+    """A record of one agent run, returned to the frontend for display."""
+
+    phase: str
+    steps: list[dict] = field(default_factory=list)
+    final: str = ""
+
+    def log_think_call(self, step: int, thought: str, name: str, kwargs: dict, result: str) -> None:
+        self.steps.append(
+            {"step": step, "think": thought, "call": name, "args": kwargs, "result": result}
+        )
+
+    def log_note(self, message: str) -> None:
+        self.steps.append({"step": -1, "note": message})
+
+
+async def run_phase(
+    *,
+    phase: str,
+    system_prompt: str,
+    user_prompt: str,
+    toolbox: "Toolbox",
+    complete_fn: Callable,
+) -> AgentTrace:
+    """Drive one isolated THINK/CALL phase to completion.
+
+    `complete_fn(messages)` is an async callable returning the model's text —
+    this is `functools.partial(llm.complete, provider)` in practice. The phase
+    ends when the model emits a reply with no CALL, or the step cap is hit.
+    """
+    specs_by_name = {s.name: s for s in toolbox.specs()}
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    trace = AgentTrace(phase=phase)
+
+    for step in range(MAX_STEPS):
+        raw = await complete_fn(messages)
+        parsed = parse_call(raw, specs_by_name)
+
+        if parsed is None:
+            trace.final = raw.strip()
+            return trace
+
+        thought, name, kwargs, body = parsed
+        spec = specs_by_name[name]
+        # A wants_body tool (file_edit) reads the post-CALL fence text from a
+        # side-channel attribute the toolbox exposes, so the tool signature
+        # stays a plain method the C-style parser can describe.
+        toolbox.call_body = body if spec.wants_body else ""
+        try:
+            result = spec.func(toolbox, **kwargs)
+            result_str = str(result)
+        except TypeError as exc:  # arity / signature mismatch from the model
+            result_str = f"ERROR: bad arguments for {name}: {exc}"
+        except Exception as exc:  # noqa: BLE001 — surface any tool failure to the model
+            result_str = f"ERROR: {exc}"
+
+        trace.log_think_call(step, thought, name, kwargs, result_str)
+
+        # Feed the model its own emission plus the tool result, then loop.
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({"role": "user", "content": f"TOOL RESULT: {result_str}"})
+
+    trace.final = "Reached the step limit before finishing."
+    trace.log_note("Step limit reached.")
+    return trace
+
+
+# Imported lazily to avoid a circular import (tools.py imports from agent.py).
+from tools import Toolbox  # noqa: E402
