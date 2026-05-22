@@ -1,0 +1,305 @@
+/* chip_styles.css
+ * -----------------------------------------------------------------------
+ * Visual styling for hardware components on the workbench, keyed by the
+ * component's `visual_type` (stored in the Supabase `components` table).
+ *
+ * Everything ELSE about a component — its dimensions, pins, category,
+ * description — comes from the database. This file is purely cosmetic:
+ * the shapes, colours and decorative sub-elements that make a chip look
+ * like the real part. Add a new visual_type here when you add one in the
+ * component catalogue.
+ *
+ * Loaded globally from +layout.svelte so the `.part` markup in +page.svelte
+ * can use these classes.
+ * ----------------------------------------------------------------------- */
+
+/* ---- generic part shell ---- */
+.part {
+	position: absolute;
+	border: 1px solid #536071;
+	border-radius: 9px;
+	background: #263140;
+	box-shadow: 0 14px 36px rgb(0 0 0 / 0.3);
+	cursor: grab;
+	user-select: none;
+	touch-action: none;
+}
+
+.part:active {
+	cursor: grabbing;
+}
+
+.part-body {
+	position: absolute;
+	inset: 0;
+	transform: rotate(var(--rot, 0deg));
+	transition: transform 0.15s ease;
+}
+
+.part.selected {
+	outline: 2px solid #74d7bb;
+	outline-offset: 3px;
+	box-shadow: 0 0 0 1px #74d7bb, 0 14px 36px rgb(0 0 0 / 0.4);
+}
+
+.part-title {
+	position: absolute;
+	top: 9px;
+	left: 14px;
+	right: 14px;
+	display: flex;
+	justify-content: space-between;
+	gap: 0.5rem;
+	font-size: 0.72rem;
+	z-index: 2;
+}
+
+.part-title small {
+	color: #9aa6b5;
+}
+
+/* ---- blue-pill (STM32 dev board) ---- */
+.blue-pill {
+	background: #1e4f98;
+	border-color: #6697d6;
+}
+
+.usb {
+	position: absolute;
+	left: 68px;
+	top: -14px;
+	width: 56px;
+	height: 30px;
+	display: grid;
+	place-items: center;
+	border-radius: 4px;
+	background: #c5ced8;
+	color: #17202b;
+	font-size: 0.66rem;
+	font-weight: 800;
+}
+
+.chip,
+.driver-chip {
+	position: absolute;
+	left: 58px;
+	top: 86px;
+	width: 74px;
+	height: 74px;
+	display: grid;
+	place-items: center;
+	border-radius: 7px;
+	background: #11151b;
+	border: 1px solid #384252;
+	font-size: 0.68rem;
+}
+
+.crystal {
+	position: absolute;
+	left: 74px;
+	top: 174px;
+	width: 42px;
+	height: 16px;
+	border-radius: 20px;
+	background: #d7dde5;
+}
+
+.reset,
+.direction {
+	position: absolute;
+	right: 16px;
+	bottom: 22px;
+	font-size: 0.62rem;
+	color: #dbeafe;
+}
+
+.direction {
+	left: 16px;
+	right: auto;
+}
+
+/* ---- motor ---- */
+.motor {
+	background: #303844;
+}
+
+.motor-body {
+	position: absolute;
+	left: 42px;
+	top: 18px;
+	width: 78px;
+	height: 78px;
+	display: grid;
+	place-items: center;
+	border-radius: 50%;
+	background: radial-gradient(circle, #dce3ea 0 38%, #8792a0 39% 60%, #313a45 61%);
+	color: #202630;
+	font-weight: 900;
+}
+
+.shaft {
+	position: absolute;
+	right: -26px;
+	top: 51px;
+	width: 36px;
+	height: 8px;
+	border-radius: 8px;
+	background: #aeb8c6;
+}
+
+/* ---- driver (L298N) ---- */
+.driver {
+	background: #27313d;
+}
+
+.driver-chip {
+	left: 58px;
+	top: 44px;
+	width: 74px;
+	height: 44px;
+}
+
+.sink {
+	position: absolute;
+	left: 136px;
+	top: 24px;
+	width: 32px;
+	height: 88px;
+	background: repeating-linear-gradient(90deg, #9aa6b5 0 4px, #566273 4px 8px);
+}
+
+/* ---- led ---- */
+.led-glow {
+	position: absolute;
+	left: 34px;
+	top: 26px;
+	width: 38px;
+	height: 38px;
+	border-radius: 50%;
+	background: #ff5a71;
+	box-shadow: 0 0 18px #ff5a71;
+}
+
+/* ---- resistor ---- */
+.resistor-body {
+	position: absolute;
+	left: 30px;
+	top: 25px;
+	width: 70px;
+	height: 20px;
+	border-radius: 20px;
+	background: linear-gradient(
+		90deg,
+		#d7b46a 0 24%,
+		#70372b 24% 34%,
+		#d7b46a 34% 56%,
+		#c83f3f 56% 66%,
+		#d7b46a 66%
+	);
+}
+
+/* ---- battery ---- */
+.battery-cap {
+	position: absolute;
+	top: -10px;
+	left: 38px;
+	width: 34px;
+	height: 12px;
+	background: #9aa6b5;
+	border-radius: 4px 4px 0 0;
+}
+
+.battery-label {
+	position: absolute;
+	inset: 38px 18px;
+	display: grid;
+	place-items: center;
+	border-radius: 6px;
+	background: #242b35;
+	font-weight: 900;
+}
+
+/* ---- pins ---- */
+.pin {
+	position: absolute;
+	z-index: 5;
+	width: 24px;
+	height: 18px;
+	padding: 0;
+	display: grid;
+	place-items: center;
+	border: 1px solid #11151b;
+	border-radius: 4px;
+	background: #e7edf4;
+	color: #11151b;
+	font-size: 0.54rem;
+	font-weight: 800;
+	transform: translate(-50%, -50%);
+	transition: box-shadow 0.1s ease, background 0.1s ease;
+}
+
+.pin:hover {
+	background: #fff;
+	box-shadow: 0 0 0 3px rgb(116 215 187 / 0.3);
+}
+
+.pin span {
+	max-width: 22px;
+	overflow: hidden;
+}
+
+.pin.role-power {
+	background: #f6c560;
+}
+.pin.role-ground {
+	background: #8995a4;
+	color: #fff;
+}
+.pin.role-pwm {
+	background: #a78bfa;
+	color: #fff;
+}
+.pin.role-motor {
+	background: #f59e0b;
+}
+.pin.role-input {
+	background: #60a5fa;
+	color: #fff;
+}
+.pin.role-output {
+	background: #52d1a4;
+}
+
+.pin.armed {
+	background: #74d7bb;
+	box-shadow: 0 0 0 4px rgb(116 215 187 / 0.35);
+}
+
+/* ---- palette thumbnails (mini chip previews) ---- */
+.thumb {
+	width: 56px;
+	height: 46px;
+	border: 1px solid #3d4653;
+	border-radius: 7px;
+	background: #27313d;
+}
+
+.thumb.board {
+	background: linear-gradient(90deg, #244e8f 0 72%, #b8c4cf 72% 88%, #11151b 88%);
+}
+.thumb.motor {
+	border-radius: 50%;
+	background: radial-gradient(circle, #d7dde5 0 38%, #6b7787 39% 58%, #222832 59%);
+}
+.thumb.driver {
+	background: repeating-linear-gradient(90deg, #233044 0 8px, #18202a 8px 16px);
+}
+.thumb.led {
+	background: radial-gradient(circle, #ff667a 0 28%, #55242c 29% 58%, #171c23 59%);
+}
+.thumb.resistor {
+	background: linear-gradient(90deg, #9ca3af 0 20%, #d8b76a 20% 80%, #9ca3af 80%);
+}
+.thumb.battery {
+	background: linear-gradient(180deg, #5a606b, #202630);
+}
