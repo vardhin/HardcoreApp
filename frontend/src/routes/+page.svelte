@@ -6,6 +6,7 @@
 	import AssistantPanel from '$lib/AssistantPanel.svelte';
 	import { background } from '$lib/chip_symbols.js';
 	import { compatibility, connectionWarning, canConnect, ROLE_LABEL } from '$lib/wiring.js';
+	import { supabase } from '$lib/supabase.js';
 
 	const API_BASE = 'http://127.0.0.1:8000';
 	const wireColors = ['#52d1a4', '#f59e0b', '#60a5fa', '#f472b6', '#f87171', '#a78bfa'];
@@ -36,6 +37,69 @@
 	let renamingProjectId = $state(null);
 	let renameDraft = $state('');
 	let busy = $state(false);
+
+	// Auth States
+	let session = $state(null);
+	let user = $state(null);
+	let authEmail = $state('');
+	let authPassword = $state('');
+	let authMode = $state('login');
+	let authLoading = $state(false);
+
+	// Captcha States
+	let captchaCode = $state('');
+	let captchaInput = $state('');
+
+	function generateCaptcha() {
+		const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+		let code = '';
+		for (let i = 0; i < 5; i++) {
+			code += chars.charAt(Math.floor(Math.random() * chars.length));
+		}
+		captchaCode = code;
+		captchaInput = '';
+	}
+
+	function setAuthMode(mode) {
+		authMode = mode;
+		authEmail = '';
+		authPassword = '';
+		generateCaptcha();
+	}
+
+	// Account Menu States
+	let accountMenuOpen = $state(false);
+	let newPassword = $state('');
+	let passwordLoading = $state(false);
+
+	function toggleAccountMenu(e) {
+		e.stopPropagation();
+		accountMenuOpen = !accountMenuOpen;
+	}
+
+	function closeAccountMenu() {
+		accountMenuOpen = false;
+	}
+
+	async function handleChangePassword(event) {
+		event.preventDefault();
+		if (!newPassword || newPassword.length < 6) {
+			toast('Password must be at least 6 characters.', 'error');
+			return;
+		}
+		passwordLoading = true;
+		try {
+			const { error } = await supabase.auth.updateUser({ password: newPassword });
+			if (error) throw error;
+			toast('Password updated successfully!', 'success');
+			newPassword = '';
+			accountMenuOpen = false;
+		} catch (error) {
+			toast(`Failed to update password: ${error.message}`, 'error');
+		} finally {
+			passwordLoading = false;
+		}
+	}
 
 	let contextMenu = $state(null);
 	let clipboard = $state(null); // a copied placed-component instance
@@ -74,15 +138,96 @@
 	);
 
 	onMount(async () => {
-		await Promise.all([loadComponents(), loadProjects()]);
-		loading = false;
+		generateCaptcha();
+		const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
+			session = newSession;
+			user = newSession?.user ?? null;
+			if (user) {
+				loading = true;
+				await Promise.all([loadComponents(), loadProjects()]);
+				loading = false;
+			} else {
+				projects = [];
+				selectedProject = null;
+				clearSelection();
+				loading = false;
+			}
+		});
+
 		window.addEventListener('keydown', handleGlobalKey);
 		window.addEventListener('beforeunload', warnUnsaved);
+		window.addEventListener('click', closeAccountMenu);
 		return () => {
+			subscription.unsubscribe();
 			window.removeEventListener('keydown', handleGlobalKey);
 			window.removeEventListener('beforeunload', warnUnsaved);
+			window.removeEventListener('click', closeAccountMenu);
 		};
 	});
+
+	async function handleEmailAuth(event) {
+		event.preventDefault();
+		if (!authEmail.trim() || !authPassword) {
+			toast('Email and password are required.', 'error');
+			return;
+		}
+		if (captchaInput.toUpperCase() !== captchaCode) {
+			toast('Captcha verification failed. Please try again.', 'error');
+			generateCaptcha();
+			return;
+		}
+		authLoading = true;
+		try {
+			if (authMode === 'login') {
+				const { error } = await supabase.auth.signInWithPassword({
+					email: authEmail.trim(),
+					password: authPassword
+				});
+				if (error) throw error;
+				toast('Welcome back!', 'success');
+			} else {
+				const { error } = await supabase.auth.signUp({
+					email: authEmail.trim(),
+					password: authPassword
+				});
+				if (error) throw error;
+				toast('Registration successful! Please check your email.', 'success');
+			}
+		} catch (error) {
+			toast(error.message, 'error');
+		} finally {
+			authLoading = false;
+		}
+	}
+
+	async function handleGoogleLogin() {
+		authLoading = true;
+		try {
+			const { error } = await supabase.auth.signInWithOAuth({
+				provider: 'google',
+				options: {
+					redirectTo: window.location.origin
+				}
+			});
+			if (error) throw error;
+		} catch (error) {
+			toast(error.message, 'error');
+		} finally {
+			authLoading = false;
+		}
+	}
+
+	async function handleLogout() {
+		if (workbenchDirty || fileDirty) {
+			if (!confirm('You have unsaved changes. Log out anyway?')) return;
+		}
+		try {
+			await supabase.auth.signOut();
+			toast('Logged out.', 'info');
+		} catch (error) {
+			toast(error.message, 'error');
+		}
+	}
 
 	function warnUnsaved(event) {
 		if (workbenchDirty || fileDirty) {
@@ -152,9 +297,17 @@
 	}
 
 	async function api(path, options = {}) {
+		const token = session?.access_token;
+		const headers = {
+			'Content-Type': 'application/json',
+			...(options.headers ?? {})
+		};
+		if (token) {
+			headers['Authorization'] = `Bearer ${token}`;
+		}
 		const response = await fetch(`${API_BASE}${path}`, {
-			headers: { 'Content-Type': 'application/json', ...(options.headers ?? {}) },
-			...options
+			...options,
+			headers
 		});
 		if (!response.ok) {
 			let detail = `Request failed (${response.status})`;
@@ -1093,34 +1246,164 @@
 	<title>HardcoreAI Hardware IDE</title>
 </svelte:head>
 
-<main class="shell">
-	<header class="topbar">
-		<div class="brand">
-			<span class="logo" aria-hidden="true"></span>
-			<div>
-				<p class="eyebrow">HardcoreAI</p>
-				<h1>Hardware Project IDE</h1>
+{#if loading}
+	<section class="empty-state big">
+		<div class="spinner"></div>
+		<p>Loading HardcoreAI…</p>
+	</section>
+{:else if !user}
+	<section class="auth-container" in:fade={{ duration: 150 }}>
+		<div class="auth-box">
+			<div class="auth-header">
+				<div class="logo-large"></div>
+				<h2>HardcoreAI</h2>
+				<p class="muted">Hardware Project IDE & Code Synthesis</p>
 			</div>
+			
+			<form onsubmit={handleEmailAuth} class="auth-form">
+				<div class="auth-toggle">
+					<button 
+						type="button" 
+						class:active={authMode === 'login'} 
+						onclick={() => setAuthMode('login')}
+					>
+						Sign In
+					</button>
+					<button 
+						type="button" 
+						class:active={authMode === 'register'} 
+						onclick={() => setAuthMode('register')}
+					>
+						Register
+					</button>
+				</div>
+
+				<label>
+					Email Address
+					<input 
+						type="email" 
+						bind:value={authEmail} 
+						placeholder="name@example.com" 
+						required 
+					/>
+				</label>
+
+				<label>
+					Password
+					<input 
+						type="password" 
+						bind:value={authPassword} 
+						placeholder="••••••••" 
+						required 
+					/>
+				</label>
+
+				<label>
+					Security Check
+					<div class="captcha-container">
+						<div class="captcha-visual" title="Click to regenerate" onclick={generateCaptcha}>
+							{#each captchaCode.split('') as char, index}
+								<span style="transform: rotate({((index * 13) % 25) - 12.5}deg) translateY({((index * 7) % 8) - 4}px);">
+									{char}
+								</span>
+							{/each}
+						</div>
+						<input 
+							type="text" 
+							bind:value={captchaInput} 
+							placeholder="Enter code" 
+							required 
+						/>
+					</div>
+				</label>
+
+				<button type="submit" class="auth-submit primary" disabled={authLoading}>
+					{authLoading ? 'Please wait...' : authMode === 'login' ? 'Sign In' : 'Register'}
+				</button>
+			</form>
+
+			<div class="auth-divider">
+				<span>or continue with</span>
+			</div>
+
+			<button onclick={handleGoogleLogin} class="google-btn" disabled={authLoading}>
+				<svg class="google-icon" viewBox="0 0 24 24" width="18" height="18">
+					<path fill="#EA4335" d="M12 5.04c1.62 0 3.08.56 4.22 1.65l3.15-3.15C17.45 1.76 14.94 1 12 1 7.35 1 3.4 3.65 1.48 7.51l3.78 2.93C6.18 7.15 8.87 5.04 12 5.04z"/>
+					<path fill="#4285F4" d="M23.49 12.27c0-.81-.07-1.59-.2-2.34H12v4.44h6.44c-.28 1.48-1.12 2.73-2.38 3.58l3.69 2.86c2.16-1.99 3.74-4.91 3.74-8.54z"/>
+					<path fill="#FBBC05" d="M5.26 10.44C4.94 11.44 4.75 12.5 4.75 13.6c0 1.1.19 2.16.51 3.16l-3.78 2.93C.54 17.59 0 15.65 0 13.6c0-2.05.54-3.99 1.48-6.09l3.78 2.93z"/>
+					<path fill="#34A853" d="M12 23c3.24 0 5.97-1.07 7.96-2.91l-3.69-2.86c-1.12.75-2.55 1.21-4.27 1.21-3.13 0-5.82-2.11-6.74-5.39L1.48 15.98C3.4 19.84 7.35 23 12 23z"/>
+				</svg>
+				Google
+			</button>
 		</div>
-		<nav>
-			<button class:active={activeView === 'dashboard'} onclick={() => (activeView = 'dashboard')}>
-				Projects
-			</button>
-			<button
-				class:active={activeView === 'workbench'}
-				disabled={!selectedProject}
-				onclick={() => (activeView = 'workbench')}
-			>
-				Workbench
-			</button>
-			<button
-				class:active={activeView === 'code'}
-				disabled={!selectedProject}
-				onclick={() => (activeView = 'code')}
-			>
-				Code
-			</button>
-		</nav>
+	</section>
+{:else}
+	<main class="shell">
+		<header class="topbar">
+			<div class="brand">
+				<span class="logo" aria-hidden="true"></span>
+				<div>
+					<p class="eyebrow">HardcoreAI</p>
+					<h1>Hardware Project IDE</h1>
+				</div>
+				<!-- Account circle container next to brand -->
+				<div class="account-container-top">
+					<button class="account-circle" onclick={toggleAccountMenu} aria-label="Account Menu">
+						{user?.email?.charAt(0).toUpperCase() ?? 'U'}
+					</button>
+					{#if accountMenuOpen}
+						<div class="account-dropdown-panel" transition:fade={{ duration: 100 }} onclick={(e) => e.stopPropagation()}>
+							<div class="account-dropdown-header">
+								<div class="avatar-large">{user?.email?.charAt(0).toUpperCase() ?? 'U'}</div>
+								<div class="header-info">
+									<strong>Developer</strong>
+									<span class="email-span" title={user?.email}>{user?.email}</span>
+								</div>
+							</div>
+							
+							<div class="divider"></div>
+
+							<form onsubmit={handleChangePassword} class="change-password-form">
+								<p class="form-title">Change Password</p>
+								<input 
+									type="password" 
+									bind:value={newPassword} 
+									placeholder="New password (min 6 chars)" 
+									required 
+								/>
+								<button type="submit" disabled={passwordLoading} class="primary mini">
+									{passwordLoading ? 'Updating...' : 'Update Password'}
+								</button>
+							</form>
+
+							<div class="divider"></div>
+
+							<button class="dropdown-logout-btn" onclick={handleLogout}>
+								Log Out
+							</button>
+						</div>
+					{/if}
+				</div>
+			</div>
+			<nav>
+				<button class:active={activeView === 'dashboard'} onclick={() => (activeView = 'dashboard')}>
+					Projects
+				</button>
+				<button
+					class:active={activeView === 'workbench'}
+					disabled={!selectedProject}
+					onclick={() => (activeView = 'workbench')}
+				>
+					Workbench
+				</button>
+				<button
+					class:active={activeView === 'code'}
+					disabled={!selectedProject}
+					onclick={() => (activeView = 'code')}
+				>
+					Code
+				</button>
+			</nav>
 
 		<!-- Workbench actions live in the navbar so the canvas gets the full
 		     panel height; they appear only while the Workbench view is open. -->
@@ -1172,13 +1455,39 @@
 		{/each}
 	</div>
 
-	{#if loading}
-		<section class="empty-state big">
-			<div class="spinner"></div>
-			<p>Loading HardcoreAI…</p>
-		</section>
-	{:else if activeView === 'dashboard'}
+	{#if activeView === 'dashboard'}
 		<section class="dashboard" in:fade={{ duration: 150 }}>
+			<div class="profile-panel">
+				<div class="profile-avatar-section">
+					<div class="profile-avatar">
+						{user?.email?.charAt(0).toUpperCase() ?? 'U'}
+					</div>
+					<div class="profile-details">
+						<h3>Developer</h3>
+						<p class="profile-email" title={user?.email ?? 'anonymous'}>{user?.email ?? 'anonymous'}</p>
+					</div>
+				</div>
+				<div class="profile-stats">
+					<div class="profile-stat-box">
+						<span>Projects</span>
+						<strong>{projects.length}</strong>
+					</div>
+					<div class="profile-stat-box">
+						<span>Status</span>
+						<strong style="font-size: 0.76rem; color: #74d7bb; text-transform: uppercase;">Active</strong>
+					</div>
+				</div>
+				<div class="profile-actions">
+					<p class="eyebrow" style="margin-bottom: 0.2rem; font-size: 0.68rem; letter-spacing: 0.05em;">Quick Settings</p>
+					<button onclick={() => toast('Profile details sync automatically.', 'success')}>
+						Status Refresh
+					</button>
+					<button onclick={handleLogout} class="logout-btn-profile">
+						Log Out
+					</button>
+				</div>
+			</div>
+
 			<form
 				class="project-form"
 				onsubmit={(event) => {
@@ -1672,6 +1981,7 @@
 		</section>
 	{/if}
 </main>
+{/if}
 
 <ContextMenu bind:this={contextMenu} />
 
@@ -2043,7 +2353,7 @@
 	/* ---- dashboard ---- */
 	.dashboard {
 		display: grid;
-		grid-template-columns: minmax(300px, 380px) 1fr;
+		grid-template-columns: 260px minmax(300px, 350px) 1fr;
 		grid-template-rows: 100%;
 		gap: 1rem;
 		align-items: stretch;
@@ -2870,5 +3180,447 @@
 		.editor-pane {
 			height: 70vh;
 		}
+	}
+
+	/* ---- auth screen ---- */
+	.auth-container {
+		display: grid;
+		place-items: center;
+		min-height: 100vh;
+		min-height: 100dvh;
+		background: radial-gradient(circle at center, #1b2330 0%, #0d1014 100%);
+		padding: 1.5rem;
+	}
+
+	.auth-box {
+		width: 100%;
+		max-width: 400px;
+		background: #11151b;
+		border: 1px solid #2b333d;
+		border-radius: 12px;
+		padding: 2.2rem 2rem;
+		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+		display: grid;
+		gap: 1.5rem;
+	}
+
+	.auth-header {
+		text-align: center;
+		display: grid;
+		gap: 0.4rem;
+	}
+
+	.logo-large {
+		width: 48px;
+		height: 48px;
+		border-radius: 12px;
+		background: linear-gradient(135deg, #74d7bb, #1f7a65);
+		box-shadow: 0 0 24px rgb(116 215 187 / 0.45);
+		margin: 0 auto 0.75rem auto;
+	}
+
+	.auth-header h2 {
+		font-size: 1.6rem;
+		font-weight: 800;
+		color: #eef3f8;
+	}
+
+	.auth-form {
+		display: grid;
+		gap: 1.1rem;
+	}
+
+	.auth-toggle {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.4rem;
+		background: #0d1014;
+		padding: 0.2rem;
+		border-radius: 8px;
+		border: 1px solid #232b35;
+	}
+
+	.auth-toggle button {
+		border: none;
+		background: transparent;
+		padding: 0.45rem;
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: #8e9aaa;
+	}
+
+	.auth-toggle button.active {
+		background: #171c23;
+		border: 1px solid #2b333d;
+		color: #74d7bb;
+	}
+
+	.auth-submit {
+		margin-top: 0.5rem;
+		font-weight: 600;
+		font-size: 0.9rem;
+	}
+
+	.auth-divider {
+		display: flex;
+		align-items: center;
+		text-align: center;
+		color: #5d6877;
+		font-size: 0.76rem;
+	}
+
+	.auth-divider::before,
+	.auth-divider::after {
+		content: '';
+		flex: 1;
+		border-bottom: 1px solid #232b35;
+	}
+
+	.auth-divider:not(:empty)::before {
+		margin-right: .5em;
+	}
+
+	.auth-divider:not(:empty)::after {
+		margin-left: .5em;
+	}
+
+	.google-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.6rem;
+		border-color: #2b333d;
+		background: #171c23;
+		color: #eef3f8;
+		font-weight: 600;
+		font-size: 0.88rem;
+		padding: 0.55rem;
+	}
+
+	.google-btn:hover {
+		background: #232b36;
+		border-color: #3b4654;
+	}
+
+	.google-icon {
+		flex-shrink: 0;
+	}
+	
+	.logout-btn {
+		font-size: 0.78rem;
+		font-weight: 600;
+		padding: 0.35rem 0.6rem;
+		background: #1c1c1f;
+		border-color: #2b2b30;
+		color: #aeb8c6;
+	}
+	
+	.logout-btn:hover {
+		background: #2b2224;
+		border-color: #66222b;
+		color: #ffb4bf;
+	}
+
+	/* ---- captcha styles ---- */
+	.captcha-container {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 0.8rem;
+		align-items: center;
+		margin-top: 0.2rem;
+	}
+
+	.captcha-visual {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.35rem;
+		background: repeating-linear-gradient(
+			45deg,
+			#141923,
+			#141923 4px,
+			#0f121a 4px,
+			#0f121a 8px
+		);
+		border: 1px dashed #3d4653;
+		padding: 0.5rem 0.95rem;
+		border-radius: 6px;
+		font-family: 'Courier New', Courier, monospace;
+		font-weight: 800;
+		font-size: 1.25rem;
+		letter-spacing: 0.12rem;
+		color: #74d7bb;
+		cursor: pointer;
+		user-select: none;
+		min-width: 110px;
+		height: 38px;
+		box-sizing: border-box;
+	}
+
+	.captcha-visual span {
+		display: inline-block;
+		text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.9);
+	}
+
+	/* ---- profile panel dashboard ---- */
+	.profile-panel {
+		display: grid;
+		gap: 1.2rem;
+		padding: 1.1rem;
+		align-content: start;
+		background: #11151b;
+		border: 1px solid #2b333d;
+		border-radius: 10px;
+		overflow-y: auto;
+		height: fit-content;
+	}
+
+	.profile-avatar-section {
+		display: flex;
+		align-items: center;
+		gap: 0.9rem;
+	}
+
+	.profile-avatar {
+		width: 48px;
+		height: 48px;
+		border-radius: 50%;
+		background: linear-gradient(135deg, #74d7bb, #1f7a65);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 1.35rem;
+		font-weight: 800;
+		color: #ffffff;
+		box-shadow: 0 0 16px rgb(116 215 187 / 0.25);
+		flex-shrink: 0;
+	}
+
+	.profile-details {
+		display: grid;
+		gap: 0.15rem;
+		min-width: 0;
+	}
+
+	.profile-details h3 {
+		font-size: 0.95rem;
+		font-weight: 700;
+		color: #eef3f8;
+	}
+
+	.profile-email {
+		font-size: 0.78rem;
+		color: #8e9aaa;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.profile-stats {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.6rem;
+		background: #0d1014;
+		padding: 0.65rem 0.55rem;
+		border-radius: 8px;
+		border: 1px solid #232b35;
+	}
+
+	.profile-stat-box {
+		text-align: center;
+		display: grid;
+		gap: 0.1rem;
+	}
+
+	.profile-stat-box span {
+		display: block;
+		font-size: 0.64rem;
+		color: #71808f;
+		text-transform: uppercase;
+		font-weight: 600;
+		letter-spacing: 0.03em;
+	}
+
+	.profile-stat-box strong {
+		font-size: 1.15rem;
+		color: #74d7bb;
+	}
+
+	.profile-actions {
+		display: grid;
+		gap: 0.45rem;
+		border-top: 1px solid #232b35;
+		padding-top: 1rem;
+	}
+
+	.profile-actions button {
+		text-align: left;
+		padding: 0.45rem 0.65rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+		border: 1px solid #2b333d;
+		background: #171c23;
+		color: #aeb8c6;
+		border-radius: 6px;
+		transition: all 0.1s ease;
+		cursor: pointer;
+	}
+
+	.profile-actions button:hover {
+		background: #232b36;
+		color: #eef3f8;
+		border-color: #3b4654;
+	}
+
+	.profile-actions .logout-btn-profile {
+		border-color: #55242c;
+		background: #201317;
+		color: #ffb4bf;
+	}
+
+	.profile-actions .logout-btn-profile:hover {
+		background: #2f171f;
+		border-color: #7a2b37;
+		color: #ffe4e8;
+	}
+
+	/* ---- account dropdown overlay styles ---- */
+	.account-container-top {
+		position: relative;
+		display: inline-block;
+		margin-left: 0.8rem;
+	}
+
+	.account-circle {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		background: linear-gradient(135deg, #74d7bb, #1f7a65);
+		border: 1px solid #3d4653;
+		color: #ffffff;
+		font-weight: 800;
+		font-size: 0.85rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+		padding: 0;
+		box-shadow: 0 0 10px rgb(116 215 187 / 0.2);
+		transition: transform 0.12s ease, box-shadow 0.12s ease;
+	}
+
+	.account-circle:hover {
+		transform: scale(1.05);
+		box-shadow: 0 0 14px rgb(116 215 187 / 0.4);
+		border-color: #74d7bb;
+	}
+
+	.account-dropdown-panel {
+		position: absolute;
+		top: calc(100% + 10px);
+		left: 0;
+		width: 260px;
+		background: #11151b;
+		border: 1px solid #2b333d;
+		border-radius: 10px;
+		padding: 1.1rem;
+		box-shadow: 0 10px 25px rgba(0, 0, 0, 0.6);
+		z-index: 100;
+		display: grid;
+		gap: 0.85rem;
+		text-align: left;
+	}
+
+	.account-dropdown-header {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+	}
+
+	.avatar-large {
+		width: 38px;
+		height: 38px;
+		border-radius: 50%;
+		background: linear-gradient(135deg, #74d7bb, #1f7a65);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 1.1rem;
+		font-weight: 800;
+		color: #ffffff;
+	}
+
+	.header-info {
+		display: grid;
+		gap: 0.1rem;
+		min-width: 0;
+	}
+
+	.header-info strong {
+		font-size: 0.88rem;
+		color: #eef3f8;
+	}
+
+	.header-info .email-span {
+		font-size: 0.76rem;
+		color: #8e9aaa;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.account-dropdown-panel .divider {
+		height: 1px;
+		background: #232b35;
+		margin: 0 -1.1rem;
+	}
+
+	.change-password-form {
+		display: grid;
+		gap: 0.55rem;
+	}
+
+	.change-password-form .form-title {
+		font-size: 0.72rem;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		color: #74d7bb;
+		margin: 0;
+	}
+
+	.change-password-form input {
+		padding: 0.45rem 0.55rem;
+		font-size: 0.8rem;
+		border-radius: 6px;
+		background: #0d1014;
+		border: 1px solid #2b333d;
+	}
+
+	.change-password-form button.mini {
+		padding: 0.4rem 0.6rem;
+		font-size: 0.78rem;
+		font-weight: 600;
+		border-radius: 6px;
+	}
+
+	.dropdown-logout-btn {
+		width: 100%;
+		text-align: left;
+		padding: 0.45rem 0.65rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+		border: 1px solid #55242c;
+		background: #201317;
+		color: #ffb4bf;
+		border-radius: 6px;
+		transition: all 0.1s ease;
+		cursor: pointer;
+	}
+
+	.dropdown-logout-btn:hover {
+		background: #2f171f;
+		border-color: #7a2b37;
+		color: #ffe4e8;
 	}
 </style>
