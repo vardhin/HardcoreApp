@@ -1,18 +1,91 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
+import base64
+import hmac
+import hashlib
+import json
+import time
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlmodel import Session, create_engine, select
 from sqlmodel import SQLModel, Field as SQLField, JSON, Column
+
+async def get_current_user_id(authorization: str = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    
+    token = authorization.split(" ")[1]
+    
+    # 1. Attempt local JWT signature verification if the secret is available
+    supabase_jwt_secret = os.environ.get("SUPABASE_JWT_SECRET")
+    if supabase_jwt_secret:
+        try:
+            parts = token.split(".")
+            if len(parts) == 3:
+                header_b64, payload_b64, signature_b64 = parts
+                
+                # Re-verify the HMAC-SHA256 signature
+                signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+                key = supabase_jwt_secret.encode("utf-8")
+                expected_sig = hmac.new(key, signing_input, hashlib.sha256).digest()
+                
+                # base64url decode signature
+                rem = len(signature_b64) % 4
+                sig_padded = signature_b64 + ("=" * (4 - rem) if rem else "")
+                decoded_sig = base64.urlsafe_b64decode(sig_padded)
+                
+                if hmac.compare_digest(expected_sig, decoded_sig):
+                    # Decode payload
+                    rem = len(payload_b64) % 4
+                    payload_padded = payload_b64 + ("=" * (4 - rem) if rem else "")
+                    payload_json = base64.urlsafe_b64decode(payload_padded).decode("utf-8")
+                    payload = json.loads(payload_json)
+                    
+                    # Verify expiration
+                    if payload.get("exp") and payload["exp"] >= int(time.time()):
+                        # Verify Supabase client audience
+                        if payload.get("aud") == "authenticated":
+                            return payload["sub"]
+        except Exception:
+            # Fall back to external Supabase validation if any error occurs
+            pass
+
+    # 2. Network Fallback
+    supabase_url = os.environ.get("SUPABASE_URL")
+    anon_key = os.environ.get("SUPABASE_ANON_KEY")
+    
+    if not supabase_url or not anon_key:
+        raise HTTPException(status_code=500, detail="Supabase configuration is missing in backend")
+        
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{supabase_url}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": anon_key
+                }
+            )
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Failed to verify token: {str(e)}")
+            
+        if response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid auth token")
+        
+        user_data = response.json()
+        return user_data["id"]
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -91,7 +164,7 @@ class ProjectRow(SQLModel, table=True):
     id: int | None = SQLField(default=None, primary_key=True)
     name: str
     description: str = ""
-    user_id: int | None = None
+    user_id: UUID | None = SQLField(default=None)
     viewport: dict[str, Any] = SQLField(
         default_factory=lambda: {"x": 0, "y": 0, "zoom": 1}, sa_column=Column(JSON)
     )
@@ -517,11 +590,103 @@ def generate_firmware(
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 
+@contextmanager
+def db_session(user_id: str | None = None):
+    with Session(engine) as session:
+        if user_id:
+            try:
+                session.execute(text("SET LOCAL ROLE authenticated"))
+                session.execute(
+                    text("SELECT set_config('request.jwt.claim.sub', :user_id, true)"),
+                    {"user_id": str(user_id)},
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to configure session RLS context: {e}")
+        yield session
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Verify connectivity early so a bad password fails loudly at startup.
     with Session(engine) as session:
-        session.exec(select(text("1")))
+        session.exec(text("SELECT 1"))
+        
+        # Self-healing migrations for user auth and isolation
+        session.exec(text("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 
+                    FROM information_schema.columns 
+                    WHERE table_schema = 'public' 
+                      AND table_name = 'projects' 
+                      AND column_name = 'user_id' 
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE public.projects DROP CONSTRAINT IF EXISTS fk_projects_user_id;
+                    ALTER TABLE public.projects ALTER COLUMN user_id TYPE uuid USING (NULL);
+                END IF;
+            END $$;
+        """))
+        
+        session.exec(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 
+                    FROM information_schema.table_constraints 
+                    WHERE constraint_name = 'fk_projects_user_id'
+                ) THEN
+                    ALTER TABLE public.projects
+                      ADD CONSTRAINT fk_projects_user_id
+                      FOREIGN KEY (user_id)
+                      REFERENCES auth.users (id)
+                      ON DELETE CASCADE;
+                END IF;
+            END $$;
+        """))
+
+        # Enable RLS
+        session.exec(text("""
+            ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE public.project_components ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE public.project_connections ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE public.code_files ENABLE ROW LEVEL SECURITY;
+        """))
+
+        # Policies
+        session.exec(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can manage their own projects') THEN
+                    CREATE POLICY "Users can manage their own projects"
+                      ON public.projects FOR ALL TO authenticated
+                      USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can manage components of their own projects') THEN
+                    CREATE POLICY "Users can manage components of their own projects"
+                      ON public.project_components FOR ALL TO authenticated
+                      USING (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = project_components.project_id AND projects.user_id = auth.uid()))
+                      WITH CHECK (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = project_components.project_id AND projects.user_id = auth.uid()));
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can manage connections of their own projects') THEN
+                    CREATE POLICY "Users can manage connections of their own projects"
+                      ON public.project_connections FOR ALL TO authenticated
+                      USING (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = project_connections.project_id AND projects.user_id = auth.uid()))
+                      WITH CHECK (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = project_connections.project_id AND projects.user_id = auth.uid()));
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can manage code files of their own projects') THEN
+                    CREATE POLICY "Users can manage code files of their own projects"
+                      ON public.code_files FOR ALL TO authenticated
+                      USING (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = code_files.project_id AND projects.user_id = auth.uid()))
+                      WITH CHECK (EXISTS (SELECT 1 FROM public.projects WHERE projects.id = code_files.project_id AND projects.user_id = auth.uid()));
+                END IF;
+            END $$;
+        """))
+        session.commit()
     yield
 
 
@@ -578,13 +743,13 @@ def project_out(project: ProjectRow) -> ProjectOut:
     )
 
 
-def get_project_or_404(session: Session, project_id: str) -> ProjectRow:
+def get_project_or_404(session: Session, project_id: str, user_id: str) -> ProjectRow:
     try:
         pid = int(project_id)
     except (TypeError, ValueError):
         raise HTTPException(status_code=404, detail="Project not found")
     project = session.get(ProjectRow, pid)
-    if not project:
+    if not project or project.user_id != UUID(user_id):
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
@@ -601,7 +766,7 @@ def health() -> dict[str, str]:
 
 @app.get("/api/components", response_model=list[ComponentDefinition])
 def list_components(q: str | None = None) -> list[ComponentDefinition]:
-    with Session(engine) as session:
+    with db_session() as session:
         catalogue = load_catalogue(session)
     if not q:
         return catalogue
@@ -616,20 +781,21 @@ def list_components(q: str | None = None) -> list[ComponentDefinition]:
 
 
 @app.get("/api/projects", response_model=list[ProjectOut])
-def list_projects() -> list[ProjectOut]:
-    with Session(engine) as session:
+def list_projects(user_id: str = Depends(get_current_user_id)) -> list[ProjectOut]:
+    with db_session(user_id) as session:
         projects = session.exec(
-            select(ProjectRow).order_by(ProjectRow.updated_at.desc())
+            select(ProjectRow).where(ProjectRow.user_id == UUID(user_id)).order_by(ProjectRow.updated_at.desc())
         ).all()
         return [project_out(p) for p in projects]
 
 
 @app.post("/api/projects", response_model=ProjectOut)
-def create_project(payload: ProjectCreate) -> ProjectOut:
-    with Session(engine) as session:
+def create_project(payload: ProjectCreate, user_id: str = Depends(get_current_user_id)) -> ProjectOut:
+    with db_session(user_id) as session:
         project = ProjectRow(
             name=payload.name.strip(),
             description=payload.description.strip(),
+            user_id=UUID(user_id),
         )
         session.add(project)
         session.commit()
@@ -645,15 +811,15 @@ def create_project(payload: ProjectCreate) -> ProjectOut:
 
 
 @app.get("/api/projects/{project_id}", response_model=ProjectOut)
-def get_project(project_id: str) -> ProjectOut:
-    with Session(engine) as session:
-        return project_out(get_project_or_404(session, project_id))
+def get_project(project_id: str, user_id: str = Depends(get_current_user_id)) -> ProjectOut:
+    with db_session(user_id) as session:
+        return project_out(get_project_or_404(session, project_id, user_id))
 
 
 @app.patch("/api/projects/{project_id}", response_model=ProjectOut)
-def update_project(project_id: str, payload: ProjectUpdate) -> ProjectOut:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def update_project(project_id: str, payload: ProjectUpdate, user_id: str = Depends(get_current_user_id)) -> ProjectOut:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         if payload.name is not None:
             project.name = payload.name.strip()
         if payload.description is not None:
@@ -666,9 +832,9 @@ def update_project(project_id: str, payload: ProjectUpdate) -> ProjectOut:
 
 
 @app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str) -> dict[str, bool]:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def delete_project(project_id: str, user_id: str = Depends(get_current_user_id)) -> dict[str, bool]:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         # ON DELETE CASCADE handles code_files / project_components /
         # project_connections, but we delete explicitly for clarity.
         for row in session.exec(
@@ -681,16 +847,16 @@ def delete_project(project_id: str) -> dict[str, bool]:
 
 
 @app.get("/api/projects/{project_id}/workbench", response_model=WorkbenchState)
-def get_workbench(project_id: str) -> WorkbenchState:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def get_workbench(project_id: str, user_id: str = Depends(get_current_user_id)) -> WorkbenchState:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         return read_workbench(session, project)
 
 
 @app.put("/api/projects/{project_id}/workbench", response_model=WorkbenchState)
-def save_workbench(project_id: str, payload: WorkbenchState) -> WorkbenchState:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def save_workbench(project_id: str, payload: WorkbenchState, user_id: str = Depends(get_current_user_id)) -> WorkbenchState:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         write_workbench(session, project, payload)
         session.commit()
         session.refresh(project)
@@ -698,9 +864,9 @@ def save_workbench(project_id: str, payload: WorkbenchState) -> WorkbenchState:
 
 
 @app.get("/api/projects/{project_id}/files", response_model=list[CodeFileRead])
-def list_files(project_id: str) -> list[CodeFileRead]:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def list_files(project_id: str, user_id: str = Depends(get_current_user_id)) -> list[CodeFileRead]:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         files = session.exec(
             select(CodeFileRow)
             .where(CodeFileRow.project_id == project.id)
@@ -713,9 +879,9 @@ def list_files(project_id: str) -> list[CodeFileRead]:
 
 
 @app.put("/api/projects/{project_id}/files/{file_path:path}", response_model=CodeFileRead)
-def upsert_file(project_id: str, file_path: str, payload: CodeFileUpsert) -> CodeFileRead:
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+def upsert_file(project_id: str, file_path: str, payload: CodeFileUpsert, user_id: str = Depends(get_current_user_id)) -> CodeFileRead:
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         code_file = session.exec(
             select(CodeFileRow).where(
                 CodeFileRow.project_id == project.id, CodeFileRow.path == file_path
@@ -785,7 +951,7 @@ def _files_as_dict(session: Session, project: ProjectRow) -> dict[str, dict[str,
 
 
 @app.post("/api/projects/{project_id}/agent/solve", response_model=AgentRunResult)
-async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
+async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Depends(get_current_user_id)) -> AgentRunResult:
     """Run the two-phase agent: configure + wire the workbench, then write code.
 
     Phase 1 reasons over the problem and the catalogue and writes the netlist.
@@ -795,8 +961,8 @@ async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
     if payload.provider not in llm.PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Unknown provider '{payload.provider}'.")
 
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         catalogue = catalogue_index(session)
         state = read_workbench(session, project)
         workbench_dict = state.model_dump()
@@ -814,12 +980,12 @@ async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
         raise HTTPException(status_code=502, detail=f"LLM error (wiring): {exc}")
 
     # Persist the netlist the wiring phase produced.
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         write_workbench(session, project, WorkbenchState(**wired))
         session.commit()
         # Re-read so phase 2 (and the response) see canonical db ids.
-        project = get_project_or_404(session, project_id)
+        project = get_project_or_404(session, project_id, user_id)
         saved_state = read_workbench(session, project)
         files_dict = _files_as_dict(session, project)
         catalogue = catalogue_index(session)
@@ -838,8 +1004,8 @@ async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
         raise HTTPException(status_code=502, detail=f"LLM error (coding): {exc}")
 
     # Persist any files the coding phase wrote.
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         for path, meta in new_files.items():
             if files_dict.get(path) == meta:
                 continue  # unchanged — skip the write
@@ -858,7 +1024,7 @@ async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
         session.add(project)
         session.commit()
 
-        project = get_project_or_404(session, project_id)
+        project = get_project_or_404(session, project_id, user_id)
         final_state = read_workbench(session, project)
         final_files = session.exec(
             select(CodeFileRow)
@@ -883,10 +1049,10 @@ async def agent_solve(project_id: str, payload: AgentRequest) -> AgentRunResult:
 
 
 @app.post("/api/projects/{project_id}/generate", response_model=FirmwareResult)
-def generate_project_firmware(project_id: str) -> FirmwareResult:
+def generate_project_firmware(project_id: str, user_id: str = Depends(get_current_user_id)) -> FirmwareResult:
     """Generate firmware from the saved workbench netlist and persist it."""
-    with Session(engine) as session:
-        project = get_project_or_404(session, project_id)
+    with db_session(user_id) as session:
+        project = get_project_or_404(session, project_id, user_id)
         state = read_workbench(session, project)
         catalogue = catalogue_index(session)
 
