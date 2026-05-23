@@ -10,6 +10,7 @@ from the resulting netlist.
 - **Backend** — FastAPI + SQLModel, **Supabase Postgres** storage.
 - **Database** — Supabase; schema and the component catalogue are managed as
   SQL migrations under `supabase/migrations/`.
+- **Emulator Service** — Go backend bridging PlatformIO, QEMU, and an interactive GDB debugging session.
 
 ## Setup
 
@@ -46,8 +47,16 @@ npm install
 npm run dev
 ```
 
-Open the URL Vite prints. The frontend talks to the API at `127.0.0.1:8000`;
-CORS accepts any local `localhost`/`127.0.0.1` port in the `51xx` range.
+Open the URL Vite prints. The frontend talks to the API at `127.0.0.1:8000` and the Emulator service at `127.0.0.1:8080`.
+
+### 4. Emulator Service (port 8080)
+
+```bash
+cd emulator-service
+go run .
+```
+
+This starts the local Go service responsible for compiling firmware via PlatformIO, launching the QEMU emulator, and bridging the GDB debugging interface.
 
 ## Data model
 
@@ -69,6 +78,7 @@ CORS accepts any local `localhost`/`127.0.0.1` port in the `51xx` range.
    STM32 GPIO header pin to real HAL init + a demo toggle loop, and writes it to
    `src/main.c`.
 4. **Code** — edit any file with syntax highlighting and save.
+5. **Emulator & Debugger** — build your project using PlatformIO, launch the QEMU STM32 simulator (`stm32vldiscovery` board), and connect an interactive GDB debugger. View live Serial Output alongside your main debugger terminal!
 
 ## AI agent
 

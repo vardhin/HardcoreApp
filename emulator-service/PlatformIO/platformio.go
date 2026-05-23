@@ -3,11 +3,19 @@ package platformio
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 )
+
+type File struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
 
 type ProjectRequest struct {
 	ProjectPath string `json:"projectPath"`
+	Files       []File `json:"files,omitempty"`
 }
 
 func runPIOCommand(projectPath string, args ...string) (string, error) {
@@ -34,6 +42,13 @@ func BuildHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	for _, file := range req.Files {
+		fullPath := filepath.Join(req.ProjectPath, file.Path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err == nil {
+			os.WriteFile(fullPath, []byte(file.Content), 0644)
+		}
 	}
 
 	output, err := BuildProject(req.ProjectPath)

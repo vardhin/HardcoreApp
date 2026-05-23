@@ -63,6 +63,9 @@ func NewGDBMI(
 		scanner: scanner,
 	}
 
+	// Consume startup prompt
+	g.Read()
+
 	g.Send("-gdb-set pagination off")
 	g.Read()
 
@@ -112,27 +115,8 @@ func (g *GDBMI) Read() ([]string, error) {
 			line,
 		)
 
-		// SUCCESS
-		if strings.HasPrefix(
-			line,
-			"^done",
-		) {
-			return lines, nil
-		}
-
-		// STOP EVENT
-		if strings.HasPrefix(
-			line,
-			"*stopped",
-		) {
-			return lines, nil
-		}
-
-		// ERROR
-		if strings.HasPrefix(
-			line,
-			"^error",
-		) {
+		// Read until GDB prompt
+		if line == "(gdb)" {
 			return lines, nil
 		}
 	}

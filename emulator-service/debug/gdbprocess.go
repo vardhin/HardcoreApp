@@ -67,7 +67,7 @@ func ConnectGDB() {
 	SendGDBCommand("set pagination off")
 
 	SendGDBCommand(
-		"file C:/Users/KI/Documents/PlatformIO/Projects/stm32_uart_debug/.pio/build/bluepill_f103c8/firmware.elf",
+		"file C:/Users/KI/Documents/PlatformIO/Projects/stm32_uart_debug/.pio/build/disco_f100rb/firmware.elf",
 	)
 
 	SendGDBCommand(

@@ -16,6 +16,10 @@ func ConnectHandler(
 	r *http.Request,
 ) {
 
+	if dbg != nil {
+		dbg.Disconnect()
+	}
+
 	debugger := &debug.GDBDebugger{}
 
 	err := debugger.Connect()
@@ -48,11 +52,11 @@ func RegistersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w,
-		"PC: 0x%X\nSP: 0x%X\nLR: 0x%X\nXPSR: 0x%X",
-		regs.PC,
-		regs.SP,
-		regs.LR,
-		regs.XPSR,
+		"PC: 0x%08X\nSP: 0x%08X\nLR: 0x%08X\nXPSR: 0x%08X\n\nR0: 0x%08X\nR1: 0x%08X\nR2: 0x%08X\nR3: 0x%08X\nR4: 0x%08X\nR5: 0x%08X\nR6: 0x%08X\nR7: 0x%08X\nR8: 0x%08X\nR9: 0x%08X\nR10: 0x%08X\nR11: 0x%08X\nR12: 0x%08X",
+		regs.PC, regs.SP, regs.LR, regs.XPSR,
+		regs.R0, regs.R1, regs.R2, regs.R3,
+		regs.R4, regs.R5, regs.R6, regs.R7,
+		regs.R8, regs.R9, regs.R10, regs.R11, regs.R12,
 	)
 }
 
@@ -98,7 +102,7 @@ func enableCORS(next http.Handler) http.Handler {
 func EmulateHandler(w http.ResponseWriter, r *http.Request) {
 
 	output, err := QEMU.RunQEMU(
-		"C:/Users/KI/Desktop/Hardcore_AI/Blinky/.pio/build/bluepill_f103c8/firmware.elf",
+		"./Blinky/.pio/build/disco_f100rb/firmware.elf",
 	)
 
 	if err != nil {
@@ -107,6 +111,30 @@ func EmulateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte(output))
+}
+
+func QemuStreamHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	ch := QEMU.Subscribe()
+	defer QEMU.Unsubscribe(ch)
+
+	for {
+		select {
+		case msg := <-ch:
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 func StepHandler(
 	w http.ResponseWriter,
@@ -151,6 +179,7 @@ func main() {
 	http.HandleFunc("/platformio/build", platformio.BuildHandler)
 	http.HandleFunc("/platformio/flash", platformio.FlashHandler)
 	http.HandleFunc("/qemu/run", EmulateHandler)
+	http.HandleFunc("/qemu/stream", QemuStreamHandler)
 	http.HandleFunc("/debug/connect", ConnectHandler)
 	http.HandleFunc("/debug/registers", RegistersHandler)
 	http.HandleFunc("/debug/halt", HaltHandler)

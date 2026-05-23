@@ -10,7 +10,7 @@
 	 * phases as the run completes, then calls `ondone` so the parent reloads the
 	 * workbench and files from the database.
 	 */
-	let { projectId, apiBase, onstatus, ondone } = $props();
+	let { projectId, apiBase, token, onstatus, ondone } = $props();
 
 	let problem = $state('');
 	let provider = $state('llamacpp');
@@ -65,9 +65,12 @@
 		activePhase = 'wiring';
 		onstatus?.('AI agent running — phase 1: wiring…');
 		try {
+			const headers = { 'Content-Type': 'application/json' };
+			if (token) headers['Authorization'] = `Bearer ${token}`;
+
 			const res = await fetch(`${apiBase}/api/projects/${projectId}/agent/solve`, {
 				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
+				headers,
 				body: JSON.stringify({ provider, problem: problem.trim() })
 			});
 			if (!res.ok) {
