@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Firmware Workspace</title>
+  </head>
+  <body>
+    <h2>PlatformIO Workspace</h2>
+
+    <input
+      type="text"
+      id="projectPath"
+      value="C:/Users/KI/Desktop/Hardcore_AI/Blinky"
+      style="width: 400px"
+    />
+
+    <br /><br />
+
+    <button onclick="buildProject()">Build</button>
+
+    <button onclick="flashProject()">Flash</button>
+
+    <br /><br />
+
+    <pre id="output"></pre>
+
+    <script>
+      async function buildProject() {
+        const path = document.getElementById("projectPath").value;
+
+        const response = await fetch("http://localhost:8080/platformio/build", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            projectPath: path,
+          }),
+        });
+
+        const data = await response.json();
+
+        console.log(data);
+
+        document.getElementById("output").innerText =
+          data.output || data.error || "No output";
+      }
+
+      async function flashProject() {
+        const path = document.getElementById("projectPath").value;
+
+        const response = await fetch("http://localhost:8080/platformio/flash", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            projectPath: path,
+          }),
+        });
+
+        const data = await response.json();
+
+        console.log(data);
+
+        document.getElementById("output").innerText =
+          data.output || data.error || "No output";
+      }
+    </script>
+  </body>
+</html>

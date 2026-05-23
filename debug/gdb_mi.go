@@ -45,22 +45,31 @@ func NewGDBMI(
 		return nil, err
 	}
 
+	scanner := bufio.NewScanner(stdout)
+
+	buf := make([]byte, 0, 1024*1024)
+
+	scanner.Buffer(
+		buf,
+		1024*1024,
+	)
+
 	g := &GDBMI{
 		cmd: cmd,
 
 		stdin:  stdin,
 		stdout: stdout,
 
-		scanner: bufio.NewScanner(stdout),
+		scanner: scanner,
 	}
 
-	g.Send("set pagination off")
+	g.Send("-gdb-set pagination off")
 	g.Read()
 
-	g.Send("set confirm off")
+	g.Send("-gdb-set confirm off")
 	g.Read()
 
-	g.Send("set mi-async on")
+	g.Send("-gdb-set mi-async on")
 	g.Read()
 
 	return g, nil
@@ -128,6 +137,10 @@ func (g *GDBMI) Read() ([]string, error) {
 		}
 	}
 
+	if err := g.scanner.Err(); err != nil {
+		return lines, err
+	}
+
 	return lines, nil
 }
 func (g *GDBMI) Connect(
@@ -142,30 +155,45 @@ func (g *GDBMI) Connect(
 	)
 
 	err := g.Send(cmd)
+
 	if err != nil {
 		return err
 	}
 
 	lines, err := g.Read()
+
 	if err != nil {
 		return err
 	}
 
 	fmt.Println("CONNECT RESPONSE:")
 
+	hasDone := false
+
 	for _, l := range lines {
 
 		fmt.Println(l)
 
+		if strings.Contains(
+			l,
+			"^connected",
+		) {
+			hasDone = true
+		}
+
 		if strings.HasPrefix(
 			l,
-			"^error",
+			"^done",
 		) {
-			return fmt.Errorf(
-				"gdb connect failed: %s",
-				l,
-			)
+			hasDone = true
 		}
+	}
+
+	if !hasDone {
+
+		return fmt.Errorf(
+			"failed to connect gdb target",
+		)
 	}
 
 	return nil
@@ -259,4 +287,35 @@ func (g *GDBMI) ReadMemoryWord(
 	}
 
 	return g.Read()
+}
+
+func (g *GDBMI) StepInstruction() error {
+
+	err := g.Send("-exec-step-instruction")
+
+	if err != nil {
+		return err
+	}
+
+	lines, err := g.Read()
+
+	if err != nil {
+		return err
+	}
+
+	for _, l := range lines {
+
+		if strings.HasPrefix(
+			l,
+			"^error",
+		) {
+
+			return fmt.Errorf(
+				"step failed: %s",
+				l,
+			)
+		}
+	}
+
+	return nil
 }
