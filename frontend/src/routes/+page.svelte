@@ -578,6 +578,8 @@
 			logTerminal(text);
 			pioStatus = 'QEMU running';
 			qemuRunning = true;
+			debuggerConnected = false;
+			debuggerRunning = false;
 		} catch(err) {
 			logTerminal('Emulator failed: ' + err.message);
 			pioStatus = 'QEMU failed';
@@ -2143,7 +2145,7 @@
 				<div class="file-list" style="padding: 1rem; display: flex; flex-direction: column; gap: 0.5rem;">
 					<button class="primary" style="width: 100%; justify-content: center;" onclick={runBuild} disabled={emulatorBusy}>Build Firmware</button>
 					<button class="primary" style="width: 100%; justify-content: center;" onclick={runFlash} disabled={emulatorBusy}>Flash (Upload)</button>
-					<button class="primary" style="width: 100%; justify-content: center;" onclick={runEmulator} disabled={emulatorBusy || qemuRunning}>Start QEMU</button>
+					<button class="primary" style="width: 100%; justify-content: center;" onclick={runEmulator} disabled={emulatorBusy}>Start / Restart QEMU</button>
 				</div>
 				<div class="component-summary">
 					<h3>Status</h3>

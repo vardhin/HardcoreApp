@@ -1,4 +1,4 @@
-# Motor Controller
+# LED Project
 
 Hardware notes and firmware plan.
 

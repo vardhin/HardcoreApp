@@ -397,14 +397,24 @@ def write_workbench(session: Session, project: ProjectRow, state: WorkbenchState
 
     # Re-insert placements, remembering the client id -> new db id mapping.
     id_map: dict[str, int] = {}
+    used_names: set[str] = set()
     for item in state.placed_components:
         component_id = slug_to_component.get(item.get("definition_id", ""))
         if component_id is None:
             continue  # unknown component slug — skip rather than crash
+            
+        base_name = item.get("display_name") or "Component"
+        instance_name = base_name
+        counter = 1
+        while instance_name in used_names:
+            instance_name = f"{base_name}_{counter}"
+            counter += 1
+        used_names.add(instance_name)
+        
         placement = ProjectComponentRow(
             project_id=project.id,
             component_id=component_id,
-            instance_name=item.get("display_name", "Component"),
+            instance_name=instance_name,
             x=float(item.get("x", 480)),
             y=float(item.get("y", 280)),
             rotation=int(item.get("rotation", 0) or 0),
@@ -658,6 +668,16 @@ async def lifespan(app: FastAPI):
         session.exec(text("""
             DO $$
             BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Anyone can read components') THEN
+                    CREATE POLICY "Anyone can read components"
+                      ON public.components FOR SELECT TO authenticated USING (true);
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Anyone can read pins') THEN
+                    CREATE POLICY "Anyone can read pins"
+                      ON public.pins FOR SELECT TO authenticated USING (true);
+                END IF;
+
                 IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE policyname = 'Users can manage their own projects') THEN
                     CREATE POLICY "Users can manage their own projects"
                       ON public.projects FOR ALL TO authenticated
@@ -991,6 +1011,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
         catalogue = catalogue_index(session)
 
     # --- Phase 2: coding (brand-new context) -------------------------------
+    import copy
     try:
         coding_trace, new_files = await run_coding_phase(
             provider=payload.provider,
@@ -998,7 +1019,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
             problem=payload.problem,
             catalogue=catalogue,
             workbench=saved_state.model_dump(),
-            files=files_dict,
+            files=copy.deepcopy(files_dict),
         )
     except llm.LLMError as exc:
         raise HTTPException(status_code=502, detail=f"LLM error (coding): {exc}")

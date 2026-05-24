@@ -31,6 +31,9 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
+
 # Per-provider display metadata, surfaced to the frontend so the panel can list
 # what is actually usable (a provider with no key is reported unavailable).
 PROVIDERS = {
@@ -48,6 +51,11 @@ PROVIDERS = {
         "label": "Gemini 2.5 Flash",
         "model": GEMINI_MODEL,
         "local": False,
+    },
+    "ollama": {
+        "label": "Ollama (local)",
+        "model": OLLAMA_MODEL,
+        "local": True,
     },
 }
 
@@ -70,7 +78,7 @@ def available_providers() -> list[dict]:
             available = bool(OPENROUTER_API_KEY)
         elif key == "gemini":
             available = bool(GEMINI_API_KEY)
-        else:  # llamacpp needs no key — availability is "is the server up?",
+        else:  # llamacpp and ollama need no key — availability is "is the server up?",
             available = True  # which we can't know without a probe, so assume yes.
         out.append({"id": key, "available": available, **meta})
     return out
@@ -101,6 +109,12 @@ async def _openai_style_complete(
 async def _llamacpp_complete(messages: list[dict]) -> str:
     return await _openai_style_complete(
         f"{LLAMACPP_URL}/v1/chat/completions", LLAMACPP_MODEL, messages
+    )
+
+
+async def _ollama_complete(messages: list[dict]) -> str:
+    return await _openai_style_complete(
+        f"{OLLAMA_URL}/v1/chat/completions", OLLAMA_MODEL, messages
     )
 
 
@@ -166,6 +180,7 @@ async def _gemini_complete(messages: list[dict]) -> str:
 
 _DISPATCH = {
     "llamacpp": _llamacpp_complete,
+    "ollama": _ollama_complete,
     "openrouter": _openrouter_complete,
     "gemini": _gemini_complete,
 }

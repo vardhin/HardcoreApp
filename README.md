@@ -97,14 +97,7 @@ Supabase directly, so the workbench and editor just re-fetch when the run ends.
 The agent uses a C-style tool-calling protocol (`CALL place_component("led-red")`)
 instead of JSON — fewer tokens and far more reliable for small/local models.
 
-In the coding phase the agent can patch files surgically rather than rewriting
-them. `file_edit` (backed by `backend/editmatch.py`) anchors on a before-block —
-the changed lines plus one unchanged context line above and below — and refuses
-to act if that anchor matches zero or many places, so a stale edit fails loudly.
-It accepts an inline form, `file_edit(path, old, new)`, or a paired form: a bare
-`CALL file_edit("src/main.c")` followed by two fenced ``` blocks (before, then
-after). Matching tolerates a copied `N|` line-number gutter and indentation
-drift.
+In the coding phase, the agent uses `write_file` to generate the full C firmware from scratch based on the exact pins that were wired up in the hardware netlist.
 
 ### Providers
 
@@ -113,6 +106,7 @@ Configured in `backend/.env` (see `.env.example`). Pick per request from the pan
 | Provider | Model | Key |
 | --- | --- | --- |
 | `llamacpp` | Prism Bonsai 8B (1-bit quant) | none — local server on `LLAMACPP_URL` |
+| `ollama` | `qwen2.5-coder:7b` | none — local server on `OLLAMA_URL` |
 | `openrouter` | `openai/gpt-oss-120b` | `OPENROUTER_API_KEY` |
 | `gemini` | `gemini-2.5-flash` | `GEMINI_API_KEY` |
 
