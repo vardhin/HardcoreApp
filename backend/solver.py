@@ -82,32 +82,39 @@ Rules:
 - Map STM32 header pin labels to ports: label like "C13" -> GPIOC pin 13,
   "A0" -> GPIOA pin 0, "B12" -> GPIOB pin 12.
 
-WRITING CODE — two tools:
-- write_file(path, content): use ONLY for a new file or a complete rewrite.
-  The second argument is the whole file as one string.
-- file_edit: PREFER this to fix or extend an existing file. Do not rewrite a
-  whole file for a small change. Put TWO fenced ``` blocks right after the
-  CALL line — the first is the exact text to find, the second the replacement.
-  Each block must include ONE unchanged context line above and below the
-  change so the before-block matches the file uniquely. Example:
+WRITING CODE — tool:
+- write_file(path, content): use to write the code. The second argument is the whole file as one string. Use Python triple quotes for the string content (e.g. \"\"\"code\"\"\").
+  
+  - The firmware must be complete and compilable: include "stm32f1xx_hal.h",
+    implement HAL_Init(), clock/GPIO init for every wired pin, and a main loop.
+  - CRITICAL RULES FOR C FIRMWARE:
+    1. Declare all global variables (like huart1) at the TOP of the file.
+    2. Use standard escape sequences for strings (e.g. "\\r\\n"). Do NOT use raw newlines.
+    3. You MUST define `void SysTick_Handler(void) {{ HAL_IncTick(); }}` at the bottom of the file so HAL timeouts work.
+    4. You MUST follow this exact structure for initialization:
 
-      CALL file_edit("src/main.c")
-      ```c
-          HAL_Init();
-          gpio_init()
-          while (1) {{
-      ```
-      ```c
-          HAL_Init();
-          gpio_init();
-          while (1) {{
-      ```
-
-  Copy the before-block exactly from read_file output, WITHOUT the "N| "
-  line-number prefix. For several edits, add more before/after fence pairs.
-
-- The firmware must be complete and compilable: include "stm32f1xx_hal.h",
-  implement HAL_Init(), clock/GPIO init for every wired pin, and a main loop.
+      UART_HandleTypeDef huart1;
+      
+      static void MX_USART1_UART_Init(void) {{
+          __HAL_RCC_USART1_CLK_ENABLE();
+          __HAL_RCC_GPIOA_CLK_ENABLE();
+          
+          GPIO_InitTypeDef GPIO_InitStruct = {{0}};
+          GPIO_InitStruct.Pin = GPIO_PIN_9;
+          GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+          GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+          HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+          
+          huart1.Instance = USART1;
+          huart1.Init.BaudRate = 115200;
+          huart1.Init.WordLength = UART_WORDLENGTH_8B;
+          huart1.Init.StopBits = UART_STOPBITS_1;
+          huart1.Init.Parity = UART_PARITY_NONE;
+          huart1.Init.Mode = UART_MODE_TX_RX;
+          huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+          huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+          HAL_UART_Init(&huart1);
+      }}
 - When src/main.c correctly implements the problem for the given netlist,
   STOP: reply with a plain sentence summarising the firmware and write NO
   THINK or CALL line.

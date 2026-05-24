@@ -10,6 +10,7 @@ from the resulting netlist.
 - **Backend** — FastAPI + SQLModel, **Supabase Postgres** storage.
 - **Database** — Supabase; schema and the component catalogue are managed as
   SQL migrations under `supabase/migrations/`.
+- **Emulator Service** — Go backend bridging PlatformIO, QEMU, and an interactive GDB debugging session.
 
 ## Setup
 
@@ -46,8 +47,16 @@ npm install
 npm run dev
 ```
 
-Open the URL Vite prints. The frontend talks to the API at `127.0.0.1:8000`;
-CORS accepts any local `localhost`/`127.0.0.1` port in the `51xx` range.
+Open the URL Vite prints. The frontend talks to the API at `127.0.0.1:8000` and the Emulator service at `127.0.0.1:8080`.
+
+### 4. Emulator Service (port 8080)
+
+```bash
+cd emulator-service
+go run .
+```
+
+This starts the local Go service responsible for compiling firmware via PlatformIO, launching the QEMU emulator, and bridging the GDB debugging interface.
 
 ## Data model
 
@@ -69,6 +78,7 @@ CORS accepts any local `localhost`/`127.0.0.1` port in the `51xx` range.
    STM32 GPIO header pin to real HAL init + a demo toggle loop, and writes it to
    `src/main.c`.
 4. **Code** — edit any file with syntax highlighting and save.
+5. **Emulator & Debugger** — build your project using PlatformIO, launch the QEMU STM32 simulator (`stm32vldiscovery` board), and connect an interactive GDB debugger. View live Serial Output alongside your main debugger terminal!
 
 ## AI agent
 
@@ -87,14 +97,7 @@ Supabase directly, so the workbench and editor just re-fetch when the run ends.
 The agent uses a C-style tool-calling protocol (`CALL place_component("led-red")`)
 instead of JSON — fewer tokens and far more reliable for small/local models.
 
-In the coding phase the agent can patch files surgically rather than rewriting
-them. `file_edit` (backed by `backend/editmatch.py`) anchors on a before-block —
-the changed lines plus one unchanged context line above and below — and refuses
-to act if that anchor matches zero or many places, so a stale edit fails loudly.
-It accepts an inline form, `file_edit(path, old, new)`, or a paired form: a bare
-`CALL file_edit("src/main.c")` followed by two fenced ``` blocks (before, then
-after). Matching tolerates a copied `N|` line-number gutter and indentation
-drift.
+In the coding phase, the agent uses `write_file` to generate the full C firmware from scratch based on the exact pins that were wired up in the hardware netlist.
 
 ### Providers
 
@@ -103,6 +106,7 @@ Configured in `backend/.env` (see `.env.example`). Pick per request from the pan
 | Provider | Model | Key |
 | --- | --- | --- |
 | `llamacpp` | Prism Bonsai 8B (1-bit quant) | none — local server on `LLAMACPP_URL` |
+| `ollama` | `qwen2.5-coder:7b` | none — local server on `OLLAMA_URL` |
 | `openrouter` | `openai/gpt-oss-120b` | `OPENROUTER_API_KEY` |
 | `gemini` | `gemini-2.5-flash` | `GEMINI_API_KEY` |
 

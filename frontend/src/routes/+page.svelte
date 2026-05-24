@@ -38,6 +38,16 @@
 	let renameDraft = $state('');
 	let busy = $state(false);
 
+	// Emulator States
+	let emulatorBusy = $state(false);
+	let debuggerConnected = $state(false);
+	let debuggerRunning = $state(false);
+	let qemuRunning = $state(false);
+	let pioStatus = $state('Idle');
+	let terminalLog = $state(['HardcoreApp Emulator Terminal Initialized.']);
+	let qemuLog = $state([]);
+	let registersData = $state('');
+
 	// Auth States
 	let session = $state(null);
 	let user = $state(null);
@@ -138,6 +148,11 @@
 	);
 
 	onMount(async () => {
+		const source = new EventSource('http://localhost:8080/qemu/stream');
+		source.onmessage = (event) => {
+			qemuLog = [...qemuLog, event.data];
+		};
+
 		generateCaptcha();
 		const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
 			session = newSession;
@@ -503,6 +518,136 @@
 			toast(error.message, 'error');
 		} finally {
 			busy = false;
+		}
+	}
+
+	function logTerminal(msg) {
+		const timestamp = new Date().toLocaleTimeString();
+		terminalLog = [...terminalLog, `[${timestamp}] ${msg}`];
+	}
+
+	async function runBuild() {
+		emulatorBusy = true;
+		pioStatus = 'Building...';
+		logTerminal('Running PlatformIO Build...');
+		try {
+			const res = await fetch('http://localhost:8080/platformio/build', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ projectPath: './Blinky', files })
+			});
+			const data = await res.json();
+			if (!data.success) throw new Error(data.error || 'Unknown build error');
+			logTerminal(data.output);
+			pioStatus = 'Build complete';
+		} catch(err) {
+			logTerminal('Build failed: ' + err.message);
+			pioStatus = 'Build failed';
+		}
+		emulatorBusy = false;
+	}
+
+	async function runFlash() {
+		emulatorBusy = true;
+		pioStatus = 'Flashing...';
+		logTerminal('Running PlatformIO Flash...');
+		try {
+			const res = await fetch('http://localhost:8080/platformio/flash', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ projectPath: './Blinky', files })
+			});
+			const data = await res.json();
+			if (!data.success) throw new Error(data.error || 'Unknown flash error');
+			logTerminal(data.output);
+			pioStatus = 'Flash complete';
+		} catch(err) {
+			logTerminal('Flash failed: ' + err.message);
+			pioStatus = 'Flash failed';
+		}
+		emulatorBusy = false;
+	}
+
+	async function runEmulator() {
+		emulatorBusy = true;
+		pioStatus = 'Starting QEMU...';
+		logTerminal('Starting QEMU Emulator...');
+		try {
+			const res = await fetch('http://localhost:8080/qemu/run');
+			const text = await res.text();
+			logTerminal(text);
+			pioStatus = 'QEMU running';
+			qemuRunning = true;
+			debuggerConnected = false;
+			debuggerRunning = false;
+		} catch(err) {
+			logTerminal('Emulator failed: ' + err.message);
+			pioStatus = 'QEMU failed';
+		}
+		emulatorBusy = false;
+	}
+
+	async function runConnect() {
+		emulatorBusy = true;
+		logTerminal('Connecting GDB Debugger...');
+		try {
+			const res = await fetch('http://localhost:8080/debug/connect');
+			if (!res.ok) throw new Error(await res.text());
+			const text = await res.text();
+			logTerminal(text);
+			debuggerConnected = true;
+			debuggerRunning = false; // Initially halted by QEMU -S
+			await fetchRegisters();
+		} catch(err) {
+			logTerminal('Debugger connection failed: ' + err.message);
+		}
+		emulatorBusy = false;
+	}
+
+	async function runHalt() {
+		try {
+			const res = await fetch('http://localhost:8080/debug/halt');
+			if (!res.ok) throw new Error(await res.text());
+			logTerminal(await res.text());
+			debuggerRunning = false;
+			await fetchRegisters();
+		} catch(err) {
+			logTerminal('Halt failed: ' + err.message);
+		}
+	}
+
+	async function runContinue() {
+		try {
+			debuggerRunning = true;
+			const res = await fetch('http://localhost:8080/debug/continue');
+			if (!res.ok) throw new Error(await res.text());
+			logTerminal(await res.text());
+		} catch(err) {
+			logTerminal('Continue failed: ' + err.message);
+			debuggerRunning = false;
+		}
+	}
+
+	async function runStep() {
+		try {
+			const res = await fetch('http://localhost:8080/debug/step');
+			if (!res.ok) throw new Error(await res.text());
+			logTerminal(await res.text());
+			debuggerRunning = false;
+			await fetchRegisters();
+		} catch(err) {
+			logTerminal('Step failed: ' + err.message);
+		}
+	}
+
+	async function fetchRegisters() {
+		try {
+			const res = await fetch('http://localhost:8080/debug/registers');
+			if (!res.ok) throw new Error(await res.text());
+			registersData = await res.text();
+			logTerminal('Registers read:\n' + registersData);
+		} catch(err) {
+			logTerminal('Read registers failed: ' + err.message);
 		}
 	}
 
@@ -1246,6 +1391,17 @@
 	<title>HardcoreAI Hardware IDE</title>
 </svelte:head>
 
+<div class="toasts">
+	{#each toasts as t (t.id)}
+		<div class="toast {t.kind}" transition:fly={{ x: 40, duration: 220 }}>
+			<span>{t.message}</span>
+			<button onclick={() => (toasts = toasts.filter((x) => x.id !== t.id))} aria-label="Dismiss">
+				×
+			</button>
+		</div>
+	{/each}
+</div>
+
 {#if loading}
 	<section class="empty-state big">
 		<div class="spinner"></div>
@@ -1403,6 +1559,13 @@
 				>
 					Code
 				</button>
+				<button
+					class:active={activeView === 'emulator'}
+					disabled={!selectedProject}
+					onclick={() => (activeView = 'emulator')}
+				>
+					Emulator
+				</button>
 			</nav>
 
 		<!-- Workbench actions live in the navbar so the canvas gets the full
@@ -1444,16 +1607,7 @@
 		</div>
 	</header>
 
-	<div class="toasts">
-		{#each toasts as t (t.id)}
-			<div class="toast {t.kind}" transition:fly={{ x: 40, duration: 220 }}>
-				<span>{t.message}</span>
-				<button onclick={() => (toasts = toasts.filter((x) => x.id !== t.id))} aria-label="Dismiss">
-					×
-				</button>
-			</div>
-		{/each}
-	</div>
+
 
 	{#if activeView === 'dashboard'}
 		<section class="dashboard" in:fade={{ duration: 150 }}>
@@ -1871,6 +2025,7 @@
 			<AssistantPanel
 				projectId={selectedProject.id}
 				apiBase={API_BASE}
+				token={session?.access_token}
 				onstatus={(text) => setStatus(text, true)}
 				ondone={onAgentDone}
 			/>
@@ -1975,9 +2130,72 @@
 			<AssistantPanel
 				projectId={selectedProject.id}
 				apiBase={API_BASE}
+				token={session?.access_token}
 				onstatus={(text) => setStatus(text, true)}
 				ondone={onAgentDone}
 			/>
+		</section>
+	{:else if activeView === 'emulator'}
+		<section class="code-shell" style="grid-template-columns: 200px 1fr 300px;" in:fade={{ duration: 150 }}>
+			<aside class="file-tree">
+				<div class="section-title">
+					<h2>PlatformIO</h2>
+					<span>Build Tools</span>
+				</div>
+				<div class="file-list" style="padding: 1rem; display: flex; flex-direction: column; gap: 0.5rem;">
+					<button class="primary" style="width: 100%; justify-content: center;" onclick={runBuild} disabled={emulatorBusy}>Build Firmware</button>
+					<button class="primary" style="width: 100%; justify-content: center;" onclick={runFlash} disabled={emulatorBusy}>Flash (Upload)</button>
+					<button class="primary" style="width: 100%; justify-content: center;" onclick={runEmulator} disabled={emulatorBusy}>Start / Restart QEMU</button>
+				</div>
+				<div class="component-summary">
+					<h3>Status</h3>
+					<p style="margin-top: 0.5rem;">{pioStatus}</p>
+				</div>
+			</aside>
+
+			<section class="editor-pane" style="display: flex; flex-direction: column;">
+				<div class="toolbar">
+					<div class="toolbar-info">
+						<strong>Emulator & Debugger</strong>
+						<span>Hardware-in-the-loop simulation</span>
+					</div>
+					<div class="row-actions">
+						<button onclick={runConnect} disabled={emulatorBusy || debuggerConnected}>
+							{debuggerConnected ? 'Connected' : 'Connect Debugger'}
+						</button>
+						<button onclick={runHalt} disabled={!debuggerConnected || !debuggerRunning}>Halt</button>
+						<button onclick={runContinue} disabled={!debuggerConnected || debuggerRunning}>Continue</button>
+						<button onclick={runStep} disabled={!debuggerConnected || debuggerRunning}>Step</button>
+						<button class="primary" onclick={fetchRegisters} disabled={!debuggerConnected || debuggerRunning}>Read Registers</button>
+					</div>
+				</div>
+				
+				<div style="display: flex; flex-direction: row; flex: 1; min-height: 0; gap: 1rem; padding: 1.5rem; background: #0b0e14; border-top: 1px solid #1f2937;">
+					<div class="terminal" style="flex: 1; color: #52d1a4; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;">
+						{#each terminalLog as log}
+							<div>{log}</div>
+						{/each}
+					</div>
+					{#if qemuLog.length > 0 || qemuRunning}
+					<div class="terminal qemu-terminal" style="flex: 1; color: #f59e0b; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; overflow-y: auto; white-space: pre-wrap; line-height: 1.5; border-left: 1px solid #1f2937; padding-left: 1rem;">
+						<h4 style="color: #fff; margin-top: 0; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.75rem;">QEMU Serial Output</h4>
+						{#each qemuLog as log}
+							<div>{log}</div>
+						{/each}
+					</div>
+					{/if}
+				</div>
+			</section>
+
+			<aside class="settings-panel">
+				<div class="section-title">
+					<h2>Registers</h2>
+					<span>Cortex-M3 State</span>
+				</div>
+				<div class="terminal" style="background: #111827; color: #f59e0b; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; padding: 1.5rem; border-radius: 8px; white-space: pre-wrap; margin: 1rem; border: 1px solid #1f2937; line-height: 1.8;">
+					{registersData || 'Not connected'}
+				</div>
+			</aside>
 		</section>
 	{/if}
 </main>

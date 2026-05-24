@@ -53,20 +53,35 @@ def _tokenize(args_str: str) -> list[Any]:
         if i >= n:
             break
         if args_str[i] == '"':
-            i += 1
+            # Check for triple quotes
+            is_triple = False
+            if i + 2 < n and args_str[i+1] == '"' and args_str[i+2] == '"':
+                is_triple = True
+                i += 3
+            else:
+                i += 1
+            
             parts: list[str] = []
-            while i < n and args_str[i] != '"':
+            while i < n:
+                if is_triple:
+                    if args_str[i] == '"' and i + 2 < n and args_str[i+1] == '"' and args_str[i+2] == '"':
+                        i += 3
+                        break
+                else:
+                    if args_str[i] == '"':
+                        i += 1
+                        break
+                
                 if args_str[i] == "\\" and i + 1 < n:
-                    # Translate the standard escapes: \n \t \r become real
-                    # control chars (multi-line file_edit args rely on this);
-                    # any other \x collapses to x (covers \" and \\).
-                    parts.append(_ESCAPES.get(args_str[i + 1], args_str[i + 1]))
+                    if is_triple:
+                        parts.append("\\")
+                        parts.append(args_str[i+1])
+                    else:
+                        parts.append(_ESCAPES.get(args_str[i + 1], args_str[i + 1]))
                     i += 2
                 else:
                     parts.append(args_str[i])
                     i += 1
-            if i < n:
-                i += 1  # consume closing quote
             tokens.append("".join(parts))
         else:
             start = i
@@ -186,39 +201,79 @@ def build_tool_block(specs: list[ToolSpec]) -> str:
     return "\n".join(lines)
 
 
+import re
+
 def parse_call(
     raw: str, specs_by_name: dict[str, ToolSpec]
 ) -> tuple[str, str, dict[str, Any], str] | None:
-    """Scan a model reply for the first THINK/CALL pair.
+    """Scan a model reply for the first THINK/CALL pair using regex.
 
     Returns (thought, tool_name, kwargs, body), or None when no parsable CALL is
-    present — in which case `raw` is the model's final answer for the phase.
-
-    `body` is the verbatim text *after* the CALL line to the end of the reply;
-    a tool with `wants_body` (file_edit) parses its ``` fence pairs out of it.
+    present - in which case `raw` is the model's final answer for the phase.
     """
-    thought = ""
-    lines = raw.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.upper().startswith("THINK:"):
-            thought = stripped[6:].strip()
-            continue
+    call_match = re.search(r"CALL\s+([a-zA-Z0-9_]+)\s*\(", raw, flags=re.IGNORECASE)
+    if not call_match:
+        # Check for model-specific sentinel
+        sentinel_idx = raw.find("<|tool_call>")
+        if sentinel_idx == -1:
+            return None
+        call_str_raw = raw[sentinel_idx:].split("<|tool_call>", 1)[1].lstrip("call:Call ").strip()
+        call_idx = sentinel_idx
+    else:
+        call_idx = call_match.start()
+        # Find the end of the line containing the CALL, or the end of the parenthesis
+        call_str_raw = raw[call_idx + 4:].lstrip(":= ").strip()
 
-        call_str: str | None = None
-        if stripped.upper().startswith("CALL"):
-            call_str = stripped[4:].lstrip(":= ").strip()
-        elif "<|tool_call>" in stripped:  # tolerate model-specific sentinels
-            call_str = stripped.split("<|tool_call>", 1)[1].lstrip("call:Call ").strip()
+    # Find the matching closing parenthesis for the call
+    open_idx = call_str_raw.find("(")
+    if open_idx != -1:
+        depth = 0
+        end_idx = -1
+        in_quote = False
+        is_triple = False
+        i = open_idx
+        n = len(call_str_raw)
+        while i < n:
+            ch = call_str_raw[i]
+            if ch == '"':
+                if i + 2 < n and call_str_raw[i+1] == '"' and call_str_raw[i+2] == '"':
+                    is_triple = not is_triple
+                    i += 2
+                elif not is_triple:
+                    in_quote = not in_quote
+            elif ch == "\\" and (in_quote or is_triple):
+                i += 1
+            elif not in_quote and not is_triple:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            i += 1
+        
+        if end_idx != -1:
+            call_str = call_str_raw[:end_idx + 1]
+            body = call_str_raw[end_idx + 1:].strip()
+        else:
+            call_str = call_str_raw
+            body = ""
+    else:
+        call_str = call_str_raw
+        body = ""
 
-        if call_str:
-            try:
-                name, kwargs = _parse_one(call_str, specs_by_name)
-            except ParseError:
-                continue
-            body = "".join(lines[i + 1:])
-            return thought, name, kwargs, body
-    return None
+    # Extract thought
+    pre_call = raw[:call_idx]
+    think_match = re.search(r"THINK:?\s*(.*)", pre_call, flags=re.IGNORECASE | re.DOTALL)
+    thought = think_match.group(1).strip() if think_match else ""
+
+    try:
+        name, kwargs = _parse_one(call_str, specs_by_name)
+    except ParseError:
+        return None
+    
+    return thought, name, kwargs, body
 
 
 def _parse_one(
@@ -307,6 +362,7 @@ async def run_phase(
 
     for step in range(MAX_STEPS):
         raw = await complete_fn(messages)
+        print("RAW LLM OUTPUT:", repr(raw))
         parsed = parse_call(raw, specs_by_name)
 
         if parsed is None:

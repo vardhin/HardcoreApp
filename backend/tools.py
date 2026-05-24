@@ -75,6 +75,9 @@ class Toolbox:
                 return c
         low = ref.lower()
         matches = [c for c in self.workbench["placed_components"] if c["display_name"].lower() == low]
+        if len(matches) == 1:
+            return matches[0]
+        matches = [c for c in self.workbench["placed_components"] if c.get("definition_id", "").lower() == low]
         return matches[0] if len(matches) == 1 else None
 
     def _definition(self, slug: str) -> Any | None:
@@ -129,7 +132,7 @@ class Toolbox:
         """Show one placed component's details and the role of each of its pins."""
         c = self._find_component(component)
         if not c:
-            return f"No placed component matches '{component}'. Use list_workbench."
+            return f"No placed component matches '{component}'. You must pass the numeric ID (e.g. '64') shown in brackets in list_workbench."
         definition = self._definition(c.get("definition_id", ""))
         if not definition:
             return self._describe_component(c)
@@ -292,16 +295,11 @@ class CodingToolbox(Toolbox):
 
     @tool
     def read_file(self, path: str) -> str:
-        """Read a code file, with a 'N| ' line-number gutter on each line."""
+        """Read a code file."""
         meta = self.files.get(path)
         if meta is None:
             return f"No file '{path}'. Use list_files."
-        content = meta.get("content", "")
-        lines = content.split("\n")
-        width = len(str(len(lines)))
-        # The gutter is for the model's reference only — file_edit strips a
-        # copied "N| " prefix back off before matching, so anchors still work.
-        return "\n".join(f"{str(i + 1).rjust(width)}| {ln}" for i, ln in enumerate(lines))
+        return meta.get("content", "")
 
     @tool
     def write_file(self, path: str, content: str) -> str:
@@ -313,8 +311,7 @@ class CodingToolbox(Toolbox):
         self.files[path] = {"language": language, "content": content}
         return f"Wrote {len(content)} chars to {path}."
 
-    @tool(wants_body=True)
-    def file_edit(self, path: str, old: str = "", new: str = "") -> str:
+    def _file_edit_disabled(self, path: str, old: str = "", new: str = "") -> str:
         """Edit part of a file: keep one unchanged context line above and below the change.
 
         Two ways to call it. Inline, for a short single-line fix:
