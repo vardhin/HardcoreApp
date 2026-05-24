@@ -308,6 +308,11 @@ class CodingToolbox(Toolbox):
         existing = self.files.get(path)
         if existing is not None:
             language = existing.get("language", language)
+            
+        # Fallback: if the AI forgets the required SysTick_Handler for the STM32 HAL, auto-inject it
+        if path.endswith(".c") and "SysTick_Handler" not in content:
+            content = content.rstrip() + "\n\nvoid SysTick_Handler(void) {\n    HAL_IncTick();\n}\n"
+            
         self.files[path] = {"language": language, "content": content}
         return f"Wrote {len(content)} chars to {path}."
 

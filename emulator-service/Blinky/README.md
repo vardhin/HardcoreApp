@@ -1,4 +1,4 @@
-# LED Project
+# Hello World
 
 Hardware notes and firmware plan.
 
