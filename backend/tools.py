@@ -284,24 +284,6 @@ class CodingToolbox(Toolbox):
     """Inspect the finished netlist and write STM32 firmware into the code files."""
 
     @tool
-    def list_files(self) -> str:
-        """List the project's code files and their sizes."""
-        if not self.files:
-            return "No code files."
-        return "\n".join(
-            f"  {path} ({meta.get('language', 'c')}, {len(meta.get('content', ''))} chars)"
-            for path, meta in self.files.items()
-        )
-
-    @tool
-    def read_file(self, path: str) -> str:
-        """Read a code file."""
-        meta = self.files.get(path)
-        if meta is None:
-            return f"No file '{path}'. Use list_files."
-        return meta.get("content", "")
-
-    @tool
     def write_file(self, path: str, content: str) -> str:
         """Replace a code file's content entirely. Use only for a new file or a full rewrite."""
         language = "markdown" if path.endswith(".md") else "c"

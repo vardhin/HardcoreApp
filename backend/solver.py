@@ -78,19 +78,20 @@ Rules:
 - Always write THINK before every CALL. Never skip THINK.
 - Arguments are positional, in the order shown. Quote every string.
 - Call netlist first to see exactly which STM32 pins are wired to what.
-- Read a file with read_file before you change it.
 - Map STM32 header pin labels to ports: label like "C13" -> GPIOC pin 13,
   "A0" -> GPIOA pin 0, "B12" -> GPIOB pin 12.
 
 WRITING CODE — tool:
 - write_file(path, content): use to write the code. The second argument is the whole file as one string. Use Python triple quotes for the string content (e.g. \"\"\"code\"\"\").
   
-  - The firmware must be complete and compilable: include "stm32f1xx_hal.h",
+  - The firmware MUST use the STM32 HAL framework. Do NOT use the legacy Standard Peripheral Library (SPL). Do NOT include "stm32f10x.h".
+  - The firmware must be complete and compilable: MUST include "stm32f1xx_hal.h",
     implement HAL_Init(), clock/GPIO init for every wired pin, and a main loop.
   - CRITICAL RULES FOR C FIRMWARE:
     1. Declare all global variables (like huart1) at the TOP of the file.
     2. Use standard escape sequences for strings (e.g. "\\r\\n"). Do NOT use raw newlines.
     3. You MUST define `void SysTick_Handler(void) {{ HAL_IncTick(); }}` at the bottom of the file so HAL timeouts work.
+    4. CRITICAL: Peripherals fail silently if clocks are off. If using UART, you MUST enable its clock (e.g., `__HAL_RCC_USART1_CLK_ENABLE()`) AND its GPIO port clock (e.g., `__HAL_RCC_GPIOA_CLK_ENABLE()`), and set the TX pin to `GPIO_MODE_AF_PP`.
 - When src/main.c correctly implements the problem for the given netlist,
   STOP: reply with a plain sentence summarising the firmware and write NO
   THINK or CALL line.
@@ -105,9 +106,6 @@ FINISHED NETLIST (the circuit is already wired — do not change it):
 
 PLACED COMPONENTS:
 {workbench}
-
-CODE FILES:
-{files}
 
 Write the firmware into src/main.c so it implements the problem for this exact
 circuit. Begin.
@@ -182,7 +180,6 @@ async def run_coding_phase(
         problem=problem or "(none given)",
         netlist=toolbox.netlist(),
         workbench=_summarise_workbench(workbench),
-        files=toolbox.list_files(),
     )
     trace = await run_phase(
         phase="coding",
