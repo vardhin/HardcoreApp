@@ -11,10 +11,12 @@ import hmac
 import hashlib
 import json
 import time
+import tempfile
+import shutil
 
 from dotenv import load_dotenv
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Form, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -995,6 +997,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
             problem=payload.problem,
             catalogue=catalogue,
             workbench=workbench_dict,
+            user_id=user_id,
         )
     except llm.LLMError as exc:
         raise HTTPException(status_code=502, detail=f"LLM error (wiring): {exc}")
@@ -1020,6 +1023,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
             catalogue=catalogue,
             workbench=saved_state.model_dump(),
             files=copy.deepcopy(files_dict),
+            user_id=user_id,
         )
     except llm.LLMError as exc:
         raise HTTPException(status_code=502, detail=f"LLM error (coding): {exc}")
@@ -1095,6 +1099,79 @@ def generate_project_firmware(project_id: str, user_id: str = Depends(get_curren
         session.commit()
         return result
 
+def _ingest_in_background(user_id: str, temp_dir: str):
+    from rag_service import RAGService
+    svc = RAGService(user_id=user_id)
+    # Stage and ingest
+    staged = svc.stage_documents(Path(temp_dir).iterdir())
+    if staged:
+        svc.ingest()
+    # Cleanup temp dir after
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.post("/api/projects/{project_id}/rag/upload")
+async def upload_documents(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    documents: list[UploadFile] = File(...),
+    user_id: str = Depends(get_current_user_id)
+):
+    if not documents:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    
+    # Verify project exists for user
+    with db_session(user_id) as session:
+        get_project_or_404(session, project_id, user_id)
+
+    # Save immediately to a temp dir so we don't block the request long
+    tmpdir = tempfile.mkdtemp()
+    tmp_path = Path(tmpdir)
+    for doc in documents:
+        if doc.filename:
+            file_path = tmp_path / doc.filename
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(doc.file, f)
+
+    background_tasks.add_task(_ingest_in_background, user_id, tmpdir)
+    return {"message": "Files uploaded successfully and are being ingested."}
+
+@app.get("/api/projects/{project_id}/rag/documents")
+async def list_documents(project_id: str, user_id: str = Depends(get_current_user_id)):
+    with db_session(user_id) as session:
+        get_project_or_404(session, project_id, user_id)
+    from rag_service import RAGService
+    svc = RAGService(user_id=user_id)
+    if not svc.config.data_dir.exists():
+        return {"documents": []}
+    files = [f.name for f in svc.config.data_dir.iterdir() if f.is_file()]
+    return {"documents": files}
+
+def _rebuild_in_background(user_id: str):
+    from rag_service import RAGService
+    svc = RAGService(user_id=user_id)
+    if svc.config.db_path.exists():
+        svc.config.db_path.unlink()
+    if svc.config.data_dir.exists() and any(svc.config.data_dir.iterdir()):
+        svc.ingest()
+
+@app.delete("/api/projects/{project_id}/rag/documents/{filename}")
+async def delete_document(
+    project_id: str,
+    filename: str,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id)
+):
+    with db_session(user_id) as session:
+        get_project_or_404(session, project_id, user_id)
+    from rag_service import RAGService
+    svc = RAGService(user_id=user_id)
+    file_path = svc.config.data_dir / filename
+    if not file_path.exists() or not file_path.is_file() or ".." in filename or "/" in filename:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    file_path.unlink()
+    background_tasks.add_task(_rebuild_in_background, user_id)
+    return {"message": "Document deleted and database rebuild queued"}
 
 if __name__ == "__main__":
     import uvicorn

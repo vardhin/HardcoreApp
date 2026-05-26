@@ -2110,7 +2110,7 @@
 				</div>
 				<label>
 					Target
-					<input value="STM32F103C8T6" readonly />
+					<input value="STM32F407" readonly />
 				</label>
 				<label>
 					Toolchain
