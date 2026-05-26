@@ -15,7 +15,11 @@
 	let problem = $state('');
 	let provider = $state('llamacpp');
 	let providers = $state([]);
+	let files = $state([]);
 	let running = $state(false);
+	let uploading = $state(false);
+	let uploadSuccess = $state(false);
+	let ingestedDocuments = $state([]);
 	let collapsed = $state(false);
 	let error = $state('');
 	// result: { provider, wiring:{steps,final}, coding:{steps,final} } | null
@@ -52,6 +56,79 @@
 		const p = providers.find((x) => x.id === id);
 		return p ? p.available : true;
 	}
+
+	async function uploadDocuments() {
+		if (files.length === 0) return;
+		uploading = true;
+		uploadSuccess = false;
+		error = '';
+		try {
+			const headers = {};
+			if (token) headers['Authorization'] = `Bearer ${token}`;
+
+			const formData = new FormData();
+			for (const file of files) {
+				formData.append('documents', file);
+			}
+
+			const res = await fetch(`${apiBase}/api/projects/${projectId}/rag/upload`, {
+				method: 'POST',
+				headers,
+				body: formData
+			});
+
+			if (!res.ok) {
+				let detail = `Upload failed (${res.status})`;
+				try { detail = (await res.json()).detail ?? detail; } catch {}
+				throw new Error(detail);
+			}
+			
+			// Clear files on success
+			files = [];
+			uploadSuccess = true;
+			fetchDocuments();
+			setTimeout(() => { uploadSuccess = false; }, 3000);
+		} catch (err) {
+			error = err.message;
+		} finally {
+			uploading = false;
+		}
+	}
+
+	async function fetchDocuments() {
+		if (!projectId) return;
+		try {
+			const headers = {};
+			if (token) headers['Authorization'] = `Bearer ${token}`;
+			const res = await fetch(`${apiBase}/api/projects/${projectId}/rag/documents`, { headers });
+			if (res.ok) {
+				const data = await res.json();
+				ingestedDocuments = data.documents || [];
+			}
+		} catch (err) {
+			console.error("Failed to fetch documents", err);
+		}
+	}
+
+	async function deleteDocument(filename) {
+		ingestedDocuments = ingestedDocuments.filter(d => d !== filename);
+		try {
+			const headers = {};
+			if (token) headers['Authorization'] = `Bearer ${token}`;
+			await fetch(`${apiBase}/api/projects/${projectId}/rag/documents/${encodeURIComponent(filename)}`, {
+				method: 'DELETE',
+				headers
+			});
+		} catch (err) {
+			console.error("Failed to delete document", err);
+		}
+	}
+
+	$effect(() => {
+		if (projectId && token) {
+			fetchDocuments();
+		}
+	});
 
 	async function solve() {
 		if (!projectId || running) return;
@@ -167,6 +244,49 @@
 				fresh one writes <code>src/main.c</code> from the netlist.
 			</p>
 
+			<hr class="section-divider" />
+
+			<label class="field file-upload">
+				Hardware Manuals / Datasheets
+				<div class="file-trigger">
+					<span class="icon">📎</span> Attach PDFs...
+					<input 
+						type="file" 
+						multiple 
+						accept=".pdf" 
+						onchange={(e) => { files = Array.from(e.target.files); uploadSuccess = false; }} 
+						disabled={running || uploading} 
+					/>
+				</div>
+				{#if files.length > 0}
+					<div class="file-list">
+						{#each files as f}
+							<span class="file-chip">{f.name}</span>
+						{/each}
+					</div>
+					<button class="upload-btn" onclick={uploadDocuments} disabled={uploading}>
+						{uploading ? 'Uploading...' : 'Upload to Knowledge Base'}
+					</button>
+				{/if}
+				{#if uploadSuccess}
+					<div class="upload-success">✅ Uploaded & ingesting in background!</div>
+				{/if}
+
+				{#if ingestedDocuments.length > 0}
+					<div class="ingested-docs">
+						<div class="ingested-title">Currently in Knowledge Base:</div>
+						<div class="file-list">
+							{#each ingestedDocuments as doc}
+								<span class="file-chip ingested">
+									{doc}
+									<button class="delete-btn" onclick={() => deleteDocument(doc)} title="Delete document">×</button>
+								</span>
+							{/each}
+						</div>
+					</div>
+				{/if}
+			</label>
+
 			{#if error}
 				<p class="hint err">{error}</p>
 			{/if}
@@ -224,6 +344,13 @@
 </aside>
 
 <style>
+	.section-divider {
+		border: 0;
+		height: 1px;
+		background: #2a313c;
+		margin: 1.5rem 0;
+	}
+
 	.assistant {
 		display: flex;
 		flex-direction: column;
@@ -322,6 +449,124 @@
 	select:focus {
 		outline: none;
 		border-color: #a78bfa;
+	}
+
+	.file-trigger {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		background: #0d1014;
+		border: 1px dashed #343c46;
+		padding: 0.55rem 0.6rem;
+		border-radius: 7px;
+		cursor: pointer;
+		position: relative;
+		color: #aeb8c6;
+		transition: border-color 0.12s ease;
+	}
+
+	.file-trigger:hover {
+		border-color: #a78bfa;
+	}
+
+	.file-trigger input {
+		position: absolute;
+		top: 0;
+		left: 0;
+		opacity: 0;
+		width: 100%;
+		height: 100%;
+		cursor: pointer;
+	}
+
+	.file-trigger input:disabled {
+		cursor: not-allowed;
+	}
+
+	.file-list {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.35rem;
+		margin-top: 0.15rem;
+	}
+
+	.file-chip {
+		background: #241d40;
+		color: #d6cdfb;
+		padding: 0.2rem 0.45rem;
+		border-radius: 4px;
+		font-size: 0.72rem;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-width: 100%;
+	}
+
+	.upload-btn {
+		margin-top: 0.5rem;
+		padding: 0.4rem 0.8rem;
+		background: #2a313c;
+		border: 1px solid #3d4551;
+		color: #aeb8c6;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.8rem;
+		transition: all 0.15s ease;
+	}
+
+	.upload-btn:hover:not(:disabled) {
+		background: #343c46;
+		border-color: #a78bfa;
+		color: #fff;
+	}
+
+	.upload-btn:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.upload-success {
+		margin-top: 0.5rem;
+		font-size: 0.8rem;
+		color: #10b981;
+	}
+
+	.ingested-docs {
+		margin-top: 1rem;
+		padding-top: 0.5rem;
+		border-top: 1px solid #2a313c;
+	}
+
+	.ingested-title {
+		font-size: 0.75rem;
+		color: #8b9bb4;
+		margin-bottom: 0.4rem;
+	}
+
+	.file-chip.ingested {
+		background: #1e2631;
+		color: #aeb8c6;
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.delete-btn {
+		background: none;
+		border: none;
+		color: #f87171;
+		cursor: pointer;
+		padding: 0 0.1rem;
+		font-size: 1rem;
+		line-height: 1;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		opacity: 0.7;
+	}
+
+	.delete-btn:hover {
+		opacity: 1;
 	}
 
 	.solve {

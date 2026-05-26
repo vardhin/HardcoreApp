@@ -40,7 +40,7 @@ Rules:
 - After a TOOL RESULT, write another THINK then your next CALL.
 - Call list_catalogue first to see what you can place, and describe_component
   before wiring so you use real pin names.
-- Every project needs the STM32 Blue Pill (slug stm32-blue-pill) as the
+- Every project needs the STM32F407 Discovery (or similar F407) as the
   controller unless the problem says otherwise.
 - Wire power and ground correctly; route motors through a driver, not straight
   to a battery; put a resistor in series with an LED.
@@ -64,7 +64,7 @@ problem is solved. Begin.
 """
 
 _CODING_SYSTEM = """\
-You are an embedded firmware engineer. You write STM32F103 (Blue Pill) HAL C
+You are an embedded firmware engineer. You write STM32F407 HAL C
 code for a circuit that has ALREADY been wired on the workbench.
 
 You have these tools:
@@ -80,12 +80,13 @@ Rules:
 - Call netlist first to see exactly which STM32 pins are wired to what.
 - Map STM32 header pin labels to ports: label like "C13" -> GPIOC pin 13,
   "A0" -> GPIOA pin 0, "B12" -> GPIOB pin 12.
+- CRITICAL: If the circuit involves a specific sensor, driver, or peripheral IC, you MUST call search_hardware_manuals BEFORE writing code to find its exact register addresses, I2C/SPI commands, and configuration sequence. DO NOT hallucinate datasheet values.
 
 WRITING CODE — tool:
 - write_file(path, content): use to write the code. The second argument is the whole file as one string. Use Python triple quotes for the string content (e.g. \"\"\"code\"\"\").
   
   - The firmware MUST use the STM32 HAL framework. Do NOT use the legacy Standard Peripheral Library (SPL). Do NOT include "stm32f10x.h".
-  - The firmware must be complete and compilable: MUST include "stm32f1xx_hal.h",
+  - The firmware must be complete and compilable: MUST include "stm32f4xx_hal.h",
     implement HAL_Init(), clock/GPIO init for every wired pin, and a main loop.
   - CRITICAL RULES FOR C FIRMWARE:
     1. Declare all global variables (like huart1) at the TOP of the file.
@@ -138,7 +139,7 @@ def _summarise_wires(workbench: dict) -> str:
 
 
 async def run_wiring_phase(
-    *, provider: str, project_name: str, problem: str, catalogue: dict, workbench: dict
+    *, provider: str, project_name: str, problem: str, catalogue: dict, workbench: dict, user_id: str
 ) -> tuple[AgentTrace, dict]:
     """Run phase 1. Returns (trace, mutated-workbench)."""
     toolbox = WiringToolbox(
@@ -146,6 +147,7 @@ async def run_wiring_phase(
         problem=problem,
         catalogue=catalogue,
         workbench=workbench,
+        user_id=user_id,
     )
     system = _WIRING_SYSTEM.format(tools=_tool_block(toolbox))
     user = _WIRING_USER.format(
@@ -165,7 +167,7 @@ async def run_wiring_phase(
 
 async def run_coding_phase(
     *, provider: str, project_name: str, problem: str, catalogue: dict,
-    workbench: dict, files: dict,
+    workbench: dict, files: dict, user_id: str
 ) -> tuple[AgentTrace, dict]:
     """Run phase 2. Returns (trace, mutated-files)."""
     toolbox = CodingToolbox(
@@ -174,6 +176,7 @@ async def run_coding_phase(
         catalogue=catalogue,
         workbench=workbench,
         files=files,
+        user_id=user_id,
     )
     system = _CODING_SYSTEM.format(tools=_tool_block(toolbox))
     user = _CODING_USER.format(

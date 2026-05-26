@@ -41,6 +41,7 @@ class Toolbox:
         catalogue: dict[str, Any],
         workbench: dict[str, Any],
         files: dict[str, dict[str, Any]] | None = None,
+        user_id: str | None = None,
     ) -> None:
         self.project_name = project_name
         self.problem = problem
@@ -51,6 +52,7 @@ class Toolbox:
         # Set by run_phase before invoking a wants_body tool: the verbatim text
         # following the CALL line, from which file_edit parses its ``` fences.
         self.call_body = ""
+        self.user_id = user_id
 
     # -- registry --------------------------------------------------------
 
@@ -368,3 +370,21 @@ class CodingToolbox(Toolbox):
 
         lines = [f"  {endpoint(w['from'])} <-> {endpoint(w['to'])}" for w in wires]
         return f"Netlist ({len(wires)} connections):\n" + "\n".join(lines)
+
+    @tool
+    def search_hardware_manuals(self, query: str) -> str:
+        """Search the user's uploaded reference manuals and datasheets for hardware information."""
+        if not self.user_id:
+            return "ERROR: user_id is not set. Cannot access the database."
+        from rag_service import RAGService
+        try:
+            svc = RAGService(user_id=str(self.user_id))
+            result = svc.query(query)
+            if result.get("returncode") != 0:
+                return f"ERROR: RAG query failed: {result.get('stderr')}"
+            context = result.get("context", "")
+            if not isinstance(context, str) or not context.strip():
+                return "No relevant information found in the uploaded manuals."
+            return context.strip()
+        except Exception as e:
+            return f"ERROR: Failed to search manuals: {e}"

@@ -96,7 +96,11 @@ async def _openai_style_complete(
         "stream": False,
     }
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(url, json=payload, headers=headers or {})
+        try:
+            resp = await client.post(url, json=payload, headers=headers or {})
+        except httpx.RequestError as exc:
+            raise LLMError(f"Failed to connect to {url}. Is the LLM service running? (Error: {exc})") from exc
+
         if resp.status_code != 200:
             raise LLMError(f"{url} returned {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
@@ -163,9 +167,13 @@ async def _gemini_complete(messages: list[dict]) -> str:
         f"{GEMINI_MODEL}:generateContent"
     )
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(
-            url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}
-        )
+        try:
+            resp = await client.post(
+                url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY}
+            )
+        except httpx.RequestError as exc:
+            raise LLMError(f"Failed to connect to Gemini API. (Error: {exc})") from exc
+            
         if resp.status_code != 200:
             raise LLMError(f"Gemini returned {resp.status_code}: {resp.text[:300]}")
         data = resp.json()

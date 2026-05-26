@@ -70,6 +70,10 @@ yarn-error.log*
 # Supabase (Local dev state)
 .supabase/
 
+# Backend User Data
+/backend/Data
+/backend/bin/
+*.exe
 
 Intial.md
 test_rls.py
