@@ -5,7 +5,13 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 export default defineConfig({
   plugins: [svelte()],
   server: {
-    port: 5173,
-    strictPort: false
+    host: "127.0.0.1",
+    port: 62016,
+    strictPort: true
+  },
+  preview: {
+    host: "127.0.0.1",
+    port: 62016,
+    strictPort: true
   }
 });

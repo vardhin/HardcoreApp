@@ -27,7 +27,7 @@
       async function buildProject() {
         const path = document.getElementById("projectPath").value;
 
-        const response = await fetch("http://localhost:8080/platformio/build", {
+        const response = await fetch("http://127.0.0.1:62019/platformio/build", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -48,7 +48,7 @@
       async function flashProject() {
         const path = document.getElementById("projectPath").value;
 
-        const response = await fetch("http://localhost:8080/platformio/flash", {
+        const response = await fetch("http://127.0.0.1:62019/platformio/flash", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

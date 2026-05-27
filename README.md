@@ -26,7 +26,7 @@ Start the local development server:
 ```bash
 npm run dev
 ```
-Open **[http://localhost:5173/](http://localhost:5173/)** in your browser to run and interact with the application.
+Open **[http://localhost:62016/](http://localhost:62016/)** in your browser to run and interact with the application.
 
 ---
 

@@ -139,7 +139,14 @@ def _summarise_wires(workbench: dict) -> str:
 
 
 async def run_wiring_phase(
-    *, provider: str, project_name: str, problem: str, catalogue: dict, workbench: dict, user_id: str
+    *,
+    provider: str,
+    project_id: str,
+    project_name: str,
+    problem: str,
+    catalogue: dict,
+    workbench: dict,
+    user_id: str,
 ) -> tuple[AgentTrace, dict]:
     """Run phase 1. Returns (trace, mutated-workbench)."""
     toolbox = WiringToolbox(
@@ -148,6 +155,7 @@ async def run_wiring_phase(
         catalogue=catalogue,
         workbench=workbench,
         user_id=user_id,
+        project_id=project_id,
     )
     system = _WIRING_SYSTEM.format(tools=_tool_block(toolbox))
     user = _WIRING_USER.format(
@@ -167,7 +175,7 @@ async def run_wiring_phase(
 
 async def run_coding_phase(
     *, provider: str, project_name: str, problem: str, catalogue: dict,
-    workbench: dict, files: dict, user_id: str
+    workbench: dict, files: dict, user_id: str, project_id: str
 ) -> tuple[AgentTrace, dict]:
     """Run phase 2. Returns (trace, mutated-files)."""
     toolbox = CodingToolbox(
@@ -177,6 +185,7 @@ async def run_coding_phase(
         workbench=workbench,
         files=files,
         user_id=user_id,
+        project_id=project_id,
     )
     system = _CODING_SYSTEM.format(tools=_tool_block(toolbox))
     user = _CODING_USER.format(

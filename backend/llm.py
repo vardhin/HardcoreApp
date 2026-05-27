@@ -22,8 +22,12 @@ import httpx
 # Provider configuration — read once at import time from the environment.
 # ---------------------------------------------------------------------------
 
-LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://localhost:8080").rstrip("/")
+LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://127.0.0.1:62021").rstrip("/")
 LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "prism-bonsai-8b-1bit")
+OPENROUTER_HTTP_REFERER = os.environ.get(
+    "OPENROUTER_HTTP_REFERER",
+    "http://127.0.0.1:62017",
+).strip()
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-oss-120b")
@@ -131,7 +135,7 @@ async def _openrouter_complete(messages: list[dict]) -> str:
         messages,
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "HTTP-Referer": "http://localhost:5173",
+            "HTTP-Referer": OPENROUTER_HTTP_REFERER,
             "X-Title": "HardcoreAI",
         },
     )

@@ -1,4 +1,4 @@
-# Hello World
+# Motor Controller
 
 Hardware notes and firmware plan.
 

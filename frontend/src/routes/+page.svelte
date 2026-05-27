@@ -4,11 +4,13 @@
 	import CodeEditor from '$lib/CodeEditor.svelte';
 	import ContextMenu from '$lib/ContextMenu.svelte';
 	import AssistantPanel from '$lib/AssistantPanel.svelte';
+	import { env } from '$env/dynamic/public';
 	import { background } from '$lib/chip_symbols.js';
 	import { compatibility, connectionWarning, canConnect, ROLE_LABEL } from '$lib/wiring.js';
 	import { supabase } from '$lib/supabase.js';
 
-	const API_BASE = 'http://127.0.0.1:8000';
+	const API_BASE = env.PUBLIC_API_BASE || 'http://127.0.0.1:62018';
+	const EMULATOR_BASE = env.PUBLIC_EMULATOR_BASE || 'http://127.0.0.1:62019';
 	const wireColors = ['#52d1a4', '#f59e0b', '#60a5fa', '#f472b6', '#f87171', '#a78bfa'];
 	const GRID = 12;
 	const CANVAS_W = 1600;
@@ -47,6 +49,8 @@
 	let terminalLog = $state(['HardcoreApp Emulator Terminal Initialized.']);
 	let qemuLog = $state([]);
 	let registersData = $state('');
+	let backendStatus = $state('checking');
+	let emulatorStatus = $state('checking');
 
 	// Auth States
 	let session = $state(null);
@@ -148,9 +152,13 @@
 	);
 
 	onMount(async () => {
-		const source = new EventSource('http://localhost:8080/qemu/stream');
+		loadServiceHealth();
+		const source = new EventSource(`${EMULATOR_BASE}/qemu/stream`);
 		source.onmessage = (event) => {
 			qemuLog = [...qemuLog, event.data];
+		};
+		source.onerror = () => {
+			emulatorStatus = 'offline';
 		};
 
 		generateCaptcha();
@@ -173,12 +181,28 @@
 		window.addEventListener('beforeunload', warnUnsaved);
 		window.addEventListener('click', closeAccountMenu);
 		return () => {
+			source.close();
 			subscription.unsubscribe();
 			window.removeEventListener('keydown', handleGlobalKey);
 			window.removeEventListener('beforeunload', warnUnsaved);
 			window.removeEventListener('click', closeAccountMenu);
 		};
 	});
+
+	async function loadServiceHealth() {
+		try {
+			const response = await fetch(`${API_BASE}/api/health`);
+			backendStatus = response.ok ? 'online' : 'offline';
+		} catch {
+			backendStatus = 'offline';
+		}
+		try {
+			const response = await fetch(`${EMULATOR_BASE}/health`);
+			emulatorStatus = response.ok ? 'online' : 'offline';
+		} catch {
+			emulatorStatus = 'offline';
+		}
+	}
 
 	async function handleEmailAuth(event) {
 		event.preventDefault();
@@ -353,7 +377,7 @@
 				await openProject(projects[0]);
 			}
 		} catch (error) {
-			toast(`Cannot reach the API. Start FastAPI on port 8000. ${error.message}`, 'error');
+			toast(`Cannot reach the API. Start FastAPI on port 62018. ${error.message}`, 'error');
 		}
 	}
 
@@ -431,7 +455,10 @@
 		selectedWireId = null;
 		pendingPin = null;
 		try {
-			await Promise.all([loadWorkbench(project.id), loadFiles(project.id)]);
+			const current = await api(`/api/projects/${project.id}`);
+			selectedProject = current;
+			projects = projects.map((item) => (item.id === current.id ? current : item));
+			await Promise.all([loadWorkbench(current.id), loadFiles(current.id)]);
 			workbenchDirty = false;
 			fileDirty = false;
 			activeView = 'workbench';
@@ -440,13 +467,30 @@
 		}
 	}
 
-	async function loadWorkbench(projectId) {
-		const data = await api(`/api/projects/${projectId}/workbench`);
-		workbench = {
-			placed_components: data.placed_components ?? [],
-			wires: data.wires ?? [],
+	function endpointLabel(placed, endpoint) {
+		const instance = placed.find((item) => item.id === endpoint?.componentId);
+		const def = instance ? definition(instance.definition_id) : null;
+		const pin = def?.pins.find((item) => item.name === endpoint?.pinName);
+		return `${instance?.display_name ?? 'Component'} ${pin?.label ?? endpoint?.pinName ?? ''}`;
+	}
+
+	function normalizeWorkbench(data) {
+		const placed = data.placed_components ?? [];
+		const wires = (data.wires ?? []).map((wire, index) => ({
+			...wire,
+			color: wire.color || wireColors[index % wireColors.length],
+			label: wire.label || `${endpointLabel(placed, wire.from)} → ${endpointLabel(placed, wire.to)}`
+		}));
+		return {
+			placed_components: placed,
+			wires,
 			viewport: data.viewport ?? { x: 0, y: 0, zoom: 1 }
 		};
+	}
+
+	async function loadWorkbench(projectId) {
+		const data = await api(`/api/projects/${projectId}/workbench`);
+		workbench = normalizeWorkbench(data);
 	}
 
 	async function loadFiles(projectId) {
@@ -462,11 +506,7 @@
 				method: 'PUT',
 				body: JSON.stringify(workbench)
 			});
-			workbench = {
-				placed_components: saved.placed_components ?? [],
-				wires: saved.wires ?? [],
-				viewport: saved.viewport ?? workbench.viewport
-			};
+			workbench = normalizeWorkbench(saved);
 			workbenchDirty = false;
 			setStatus(`Workbench saved ${new Date().toLocaleTimeString()}`);
 			touchProjectTimestamp();
@@ -531,7 +571,7 @@
 		pioStatus = 'Building...';
 		logTerminal('Running PlatformIO Build...');
 		try {
-			const res = await fetch('http://localhost:8080/platformio/build', {
+			const res = await fetch(`${EMULATOR_BASE}/platformio/build`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ projectPath: './Blinky', files })
@@ -552,7 +592,7 @@
 		pioStatus = 'Flashing...';
 		logTerminal('Running PlatformIO Flash...');
 		try {
-			const res = await fetch('http://localhost:8080/platformio/flash', {
+			const res = await fetch(`${EMULATOR_BASE}/platformio/flash`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ projectPath: './Blinky', files })
@@ -573,7 +613,7 @@
 		pioStatus = 'Starting QEMU...';
 		logTerminal('Starting QEMU Emulator...');
 		try {
-			const res = await fetch('http://localhost:8080/qemu/run');
+			const res = await fetch(`${EMULATOR_BASE}/qemu/run`);
 			const text = await res.text();
 			logTerminal(text);
 			pioStatus = 'QEMU running';
@@ -591,7 +631,7 @@
 		emulatorBusy = true;
 		logTerminal('Connecting GDB Debugger...');
 		try {
-			const res = await fetch('http://localhost:8080/debug/connect');
+			const res = await fetch(`${EMULATOR_BASE}/debug/connect`);
 			if (!res.ok) throw new Error(await res.text());
 			const text = await res.text();
 			logTerminal(text);
@@ -606,7 +646,7 @@
 
 	async function runHalt() {
 		try {
-			const res = await fetch('http://localhost:8080/debug/halt');
+			const res = await fetch(`${EMULATOR_BASE}/debug/halt`);
 			if (!res.ok) throw new Error(await res.text());
 			logTerminal(await res.text());
 			debuggerRunning = false;
@@ -619,7 +659,7 @@
 	async function runContinue() {
 		try {
 			debuggerRunning = true;
-			const res = await fetch('http://localhost:8080/debug/continue');
+			const res = await fetch(`${EMULATOR_BASE}/debug/continue`);
 			if (!res.ok) throw new Error(await res.text());
 			logTerminal(await res.text());
 		} catch(err) {
@@ -630,7 +670,7 @@
 
 	async function runStep() {
 		try {
-			const res = await fetch('http://localhost:8080/debug/step');
+			const res = await fetch(`${EMULATOR_BASE}/debug/step`);
 			if (!res.ok) throw new Error(await res.text());
 			logTerminal(await res.text());
 			debuggerRunning = false;
@@ -642,7 +682,7 @@
 
 	async function fetchRegisters() {
 		try {
-			const res = await fetch('http://localhost:8080/debug/registers');
+			const res = await fetch(`${EMULATOR_BASE}/debug/registers`);
 			if (!res.ok) throw new Error(await res.text());
 			registersData = await res.text();
 			logTerminal('Registers read:\n' + registersData);
@@ -1454,16 +1494,16 @@
 					/>
 				</label>
 
-				<label>
-					Security Check
-					<div class="captcha-container">
-						<div class="captcha-visual" title="Click to regenerate" onclick={generateCaptcha}>
-							{#each captchaCode.split('') as char, index}
-								<span style="transform: rotate({((index * 13) % 25) - 12.5}deg) translateY({((index * 7) % 8) - 4}px);">
-									{char}
-								</span>
-							{/each}
-						</div>
+					<label>
+						Security Check
+						<div class="captcha-container">
+							<button type="button" class="captcha-visual" title="Click to regenerate" onclick={generateCaptcha}>
+								{#each captchaCode.split('') as char, index}
+									<span style="transform: rotate({((index * 13) % 25) - 12.5}deg) translateY({((index * 7) % 8) - 4}px);">
+										{char}
+									</span>
+								{/each}
+							</button>
 						<input 
 							type="text" 
 							bind:value={captchaInput} 
@@ -1506,9 +1546,17 @@
 				<div class="account-container-top">
 					<button class="account-circle" onclick={toggleAccountMenu} aria-label="Account Menu">
 						{user?.email?.charAt(0).toUpperCase() ?? 'U'}
-					</button>
-					{#if accountMenuOpen}
-						<div class="account-dropdown-panel" transition:fade={{ duration: 100 }} onclick={(e) => e.stopPropagation()}>
+						</button>
+						{#if accountMenuOpen}
+							<div
+								class="account-dropdown-panel"
+								role="dialog"
+								aria-label="Account settings"
+								tabindex="-1"
+								transition:fade={{ duration: 100 }}
+								onclick={(e) => e.stopPropagation()}
+								onkeydown={(e) => e.stopPropagation()}
+							>
 							<div class="account-dropdown-header">
 								<div class="avatar-large">{user?.email?.charAt(0).toUpperCase() ?? 'U'}</div>
 								<div class="header-info">
@@ -1627,13 +1675,21 @@
 						<strong>{projects.length}</strong>
 					</div>
 					<div class="profile-stat-box">
-						<span>Status</span>
-						<strong style="font-size: 0.76rem; color: #74d7bb; text-transform: uppercase;">Active</strong>
+						<span>API</span>
+						<strong style={`font-size: 0.76rem; color: ${backendStatus === 'online' ? '#74d7bb' : '#f87171'}; text-transform: uppercase;`}>
+							{backendStatus}
+						</strong>
+					</div>
+					<div class="profile-stat-box">
+						<span>Emulator</span>
+						<strong style={`font-size: 0.76rem; color: ${emulatorStatus === 'online' ? '#74d7bb' : '#f87171'}; text-transform: uppercase;`}>
+							{emulatorStatus}
+						</strong>
 					</div>
 				</div>
 				<div class="profile-actions">
 					<p class="eyebrow" style="margin-bottom: 0.2rem; font-size: 0.68rem; letter-spacing: 0.05em;">Quick Settings</p>
-					<button onclick={() => toast('Profile details sync automatically.', 'success')}>
+					<button onclick={loadServiceHealth}>
 						Status Refresh
 					</button>
 					<button onclick={handleLogout} class="logout-btn-profile">

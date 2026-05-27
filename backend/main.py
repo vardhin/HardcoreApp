@@ -200,6 +200,8 @@ class ProjectConnectionRow(SQLModel, table=True):
     from_pin_label: str
     to_instance_id: int = SQLField(foreign_key="project_components.id")
     to_pin_label: str
+    label: str | None = None
+    color: str | None = None
     created_at: datetime = SQLField(default_factory=now_utc)
 
 
@@ -367,6 +369,8 @@ def read_workbench(session: Session, project: ProjectRow) -> WorkbenchState:
             "id": str(c.id),
             "from": {"componentId": str(c.from_instance_id), "pinName": c.from_pin_label},
             "to": {"componentId": str(c.to_instance_id), "pinName": c.to_pin_label},
+            "label": c.label or "",
+            "color": c.color or "",
         }
         for c in connections
     ]
@@ -439,6 +443,8 @@ def write_workbench(session: Session, project: ProjectRow, state: WorkbenchState
                 from_pin_label=wire.get("from", {}).get("pinName", ""),
                 to_instance_id=dst,
                 to_pin_label=wire.get("to", {}).get("pinName", ""),
+                label=wire.get("label") or "",
+                color=wire.get("color") or "",
             )
         )
 
@@ -666,6 +672,12 @@ async def lifespan(app: FastAPI):
             ALTER TABLE public.code_files ENABLE ROW LEVEL SECURITY;
         """))
 
+        session.exec(text("""
+            ALTER TABLE public.project_connections
+              ADD COLUMN IF NOT EXISTS label text,
+              ADD COLUMN IF NOT EXISTS color text;
+        """))
+
         # Policies
         session.exec(text("""
             DO $$
@@ -714,9 +726,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="HardcoreAI API", version="0.3.0", lifespan=lifespan)
 
-# Accept any localhost/127.0.0.1 port: Vite picks 5173 but falls back to
-# 5174+ when that's taken, and `vite preview` uses 4173 — pinning a narrow
-# port range caused the dev frontend to be blocked by CORS.
+# The frontend normally runs on 127.0.0.1:62017, but keeping this to localhost
+# origins lets preview builds and one-off dev ports work without CORS churn.
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
@@ -993,6 +1004,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
     try:
         wiring_trace, wired = await run_wiring_phase(
             provider=payload.provider,
+            project_id=project_id,
             project_name=project.name,
             problem=payload.problem,
             catalogue=catalogue,
@@ -1024,6 +1036,7 @@ async def agent_solve(project_id: str, payload: AgentRequest, user_id: str = Dep
             workbench=saved_state.model_dump(),
             files=copy.deepcopy(files_dict),
             user_id=user_id,
+            project_id=project_id,
         )
     except llm.LLMError as exc:
         raise HTTPException(status_code=502, detail=f"LLM error (coding): {exc}")
@@ -1099,9 +1112,9 @@ def generate_project_firmware(project_id: str, user_id: str = Depends(get_curren
         session.commit()
         return result
 
-def _ingest_in_background(user_id: str, temp_dir: str):
+def _ingest_in_background(user_id: str, project_id: str, temp_dir: str):
     from rag_service import RAGService
-    svc = RAGService(user_id=user_id)
+    svc = RAGService(user_id=user_id, project_id=project_id)
     # Stage and ingest
     staged = svc.stage_documents(Path(temp_dir).iterdir())
     if staged:
@@ -1132,7 +1145,7 @@ async def upload_documents(
             with open(file_path, "wb") as f:
                 shutil.copyfileobj(doc.file, f)
 
-    background_tasks.add_task(_ingest_in_background, user_id, tmpdir)
+    background_tasks.add_task(_ingest_in_background, user_id, project_id, tmpdir)
     return {"message": "Files uploaded successfully and are being ingested."}
 
 @app.get("/api/projects/{project_id}/rag/documents")
@@ -1140,15 +1153,15 @@ async def list_documents(project_id: str, user_id: str = Depends(get_current_use
     with db_session(user_id) as session:
         get_project_or_404(session, project_id, user_id)
     from rag_service import RAGService
-    svc = RAGService(user_id=user_id)
+    svc = RAGService(user_id=user_id, project_id=project_id)
     if not svc.config.data_dir.exists():
         return {"documents": []}
     files = [f.name for f in svc.config.data_dir.iterdir() if f.is_file()]
     return {"documents": files}
 
-def _rebuild_in_background(user_id: str):
+def _rebuild_in_background(user_id: str, project_id: str):
     from rag_service import RAGService
-    svc = RAGService(user_id=user_id)
+    svc = RAGService(user_id=user_id, project_id=project_id)
     if svc.config.db_path.exists():
         svc.config.db_path.unlink()
     if svc.config.data_dir.exists() and any(svc.config.data_dir.iterdir()):
@@ -1164,16 +1177,20 @@ async def delete_document(
     with db_session(user_id) as session:
         get_project_or_404(session, project_id, user_id)
     from rag_service import RAGService
-    svc = RAGService(user_id=user_id)
+    svc = RAGService(user_id=user_id, project_id=project_id)
     file_path = svc.config.data_dir / filename
     if not file_path.exists() or not file_path.is_file() or ".." in filename or "/" in filename:
         raise HTTPException(status_code=404, detail="File not found")
     
     file_path.unlink()
-    background_tasks.add_task(_rebuild_in_background, user_id)
+    background_tasks.add_task(_rebuild_in_background, user_id, project_id)
     return {"message": "Document deleted and database rebuild queued"}
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host=os.environ.get("BACKEND_HOST", "127.0.0.1"),
+        port=int(os.environ.get("BACKEND_PORT", "62018")),
+    )

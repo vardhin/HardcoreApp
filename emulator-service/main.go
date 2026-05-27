@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"os"
 
 	platformio "hardcore-debug/PlatformIO"
 	QEMU "hardcore-debug/QEMU"
@@ -10,6 +12,27 @@ import (
 )
 
 var dbg *debug.GDBDebugger
+
+func envOrDefault(key string, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"status":"ok","debugger_connected":%t}`, dbg != nil)
+}
+
+func requireDebugger(w http.ResponseWriter) bool {
+	if dbg == nil {
+		http.Error(w, "Debugger is not connected", http.StatusConflict)
+		return false
+	}
+	return true
+}
 
 func ConnectHandler(
 	w http.ResponseWriter,
@@ -43,6 +66,9 @@ func ConnectHandler(
 	)
 }
 func RegistersHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireDebugger(w) {
+		return
+	}
 
 	regs, err := dbg.ReadRegisters()
 
@@ -61,6 +87,9 @@ func RegistersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func HaltHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireDebugger(w) {
+		return
+	}
 
 	err := dbg.Halt()
 
@@ -73,6 +102,9 @@ func HaltHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func ContinueHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireDebugger(w) {
+		return
+	}
 
 	err := dbg.Continue()
 
@@ -156,6 +188,10 @@ func StepHandler(
 		}
 	}()
 
+	if !requireDebugger(w) {
+		return
+	}
+
 	err := dbg.Step()
 
 	if err != nil {
@@ -176,6 +212,7 @@ func StepHandler(
 }
 func main() {
 
+	http.HandleFunc("/health", HealthHandler)
 	http.HandleFunc("/platformio/build", platformio.BuildHandler)
 	http.HandleFunc("/platformio/flash", platformio.FlashHandler)
 	http.HandleFunc("/qemu/run", EmulateHandler)
@@ -189,10 +226,14 @@ func main() {
 		StepHandler,
 	)
 
-	fmt.Println("Server running on :8080")
+	host := envOrDefault("EMULATOR_HOST", "127.0.0.1")
+	port := envOrDefault("EMULATOR_PORT", "62019")
+	addr := net.JoinHostPort(host, port)
+
+	fmt.Printf("Server running on http://%s\n", addr)
 
 	err := http.ListenAndServe(
-		":8080",
+		addr,
 		enableCORS(http.DefaultServeMux),
 	)
 

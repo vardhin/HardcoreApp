@@ -15,7 +15,7 @@ The project also includes PlatformIO build/flash integration and infrastructure 
 Run ARM firmware inside QEMU directly from the backend.
 
 ```bash
-curl http://localhost:8080/qemu/run
+curl http://127.0.0.1:62019/qemu/run
 ```
 
 Uses:
@@ -54,7 +54,7 @@ Backend APIs for:
 ## Connect Debugger
 
 ```bash
-curl http://localhost:8080/debug/connect
+curl http://127.0.0.1:62019/debug/connect
 ```
 
 ---
@@ -62,7 +62,7 @@ curl http://localhost:8080/debug/connect
 ## Halt CPU
 
 ```bash
-curl http://localhost:8080/debug/halt
+curl http://127.0.0.1:62019/debug/halt
 ```
 
 ---
@@ -70,7 +70,7 @@ curl http://localhost:8080/debug/halt
 ## Continue Execution
 
 ```bash
-curl http://localhost:8080/debug/continue
+curl http://127.0.0.1:62019/debug/continue
 ```
 
 ---
@@ -78,7 +78,7 @@ curl http://localhost:8080/debug/continue
 ## Step Instruction
 
 ```bash
-curl http://localhost:8080/debug/step
+curl http://127.0.0.1:62019/debug/step
 ```
 
 ---
@@ -86,7 +86,7 @@ curl http://localhost:8080/debug/step
 ## Read Registers
 
 ```bash
-curl http://localhost:8080/debug/registers
+curl http://127.0.0.1:62019/debug/registers
 ```
 
 ---
@@ -123,7 +123,7 @@ go run .
 Server starts on:
 
 ```text
-http://localhost:8080
+http://127.0.0.1:62019
 ```
 
 ---

@@ -54,6 +54,7 @@ func RunQEMU(firmwarePath string) (string, error) {
 		"qemu-system-arm",
 		"-M", "stm32vldiscovery",
 		"-kernel", firmwarePath,
+		"-S",
 		"-gdb", "tcp::3333",
 		"-display", "none",
 		"-serial", "tcp:127.0.0.1:4444,server,nowait",

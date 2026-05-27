@@ -34,10 +34,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
+        "http://localhost:62016",
+        "http://localhost:62017",
+        "http://127.0.0.1:62016",
+        "http://127.0.0.1:62017",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -57,3 +57,12 @@ async def root() -> dict[str, object]:
         "data_dir": str(config.data_dir),
     }
 
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.environ.get("RAG_API_HOST", "127.0.0.1"),
+        port=int(os.environ.get("RAG_API_PORT", "62020")),
+    )

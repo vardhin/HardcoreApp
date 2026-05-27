@@ -42,6 +42,7 @@ class Toolbox:
         workbench: dict[str, Any],
         files: dict[str, dict[str, Any]] | None = None,
         user_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         self.project_name = project_name
         self.problem = problem
@@ -53,6 +54,7 @@ class Toolbox:
         # following the CALL line, from which file_edit parses its ``` fences.
         self.call_body = ""
         self.user_id = user_id
+        self.project_id = project_id
 
     # -- registry --------------------------------------------------------
 
@@ -374,11 +376,11 @@ class CodingToolbox(Toolbox):
     @tool
     def search_hardware_manuals(self, query: str) -> str:
         """Search the user's uploaded reference manuals and datasheets for hardware information."""
-        if not self.user_id:
-            return "ERROR: user_id is not set. Cannot access the database."
+        if not self.user_id or not self.project_id:
+            return "ERROR: user_id or project_id is not set. Cannot access the project knowledge base."
         from rag_service import RAGService
         try:
-            svc = RAGService(user_id=str(self.user_id))
+            svc = RAGService(user_id=str(self.user_id), project_id=str(self.project_id))
             result = svc.query(query)
             if result.get("returncode") != 0:
                 return f"ERROR: RAG query failed: {result.get('stderr')}"

@@ -45,9 +45,19 @@ class RAGConfig:
 
 
 class RAGService:
-    def __init__(self, config: RAGConfig | None = None, user_id: str | None = None) -> None:
+    def __init__(
+        self,
+        config: RAGConfig | None = None,
+        user_id: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
         self.config = config or RAGConfig.from_env()
-        if user_id:
+        if user_id and project_id:
+            base = Path("data/users") / str(user_id) / "projects" / str(project_id)
+            self.config.db_path = base / "rag.db"
+            self.config.data_dir = base / "documents"
+            self.config.upload_dir = base / "uploads"
+        elif user_id:
             self.config.db_path = Path(f"data/users/{user_id}.db")
             self.config.data_dir = Path(f"data/users/{user_id}_data")
             self.config.upload_dir = Path(f"data/users/{user_id}_uploads")

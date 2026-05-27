@@ -1,0 +1,4 @@
+# Supabase local artifacts — keep migrations/ and config.toml, ignore the rest.
+.branches
+.temp
+.env

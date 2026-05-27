@@ -29,6 +29,8 @@ npm run dev
 npm run dev -- --open
 ```
 
+The app is pinned to `http://127.0.0.1:62017` so it avoids common Vite ports.
+
 ## Building
 
 To create a production version of your app:
